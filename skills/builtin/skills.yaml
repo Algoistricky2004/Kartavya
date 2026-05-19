@@ -1,0 +1,121 @@
+---
+# skills/builtin/debug_workflow.yaml
+# A skill that captures the common debug pattern:
+# grep → read → identify → fix → test
+
+name: debug_workflow
+version: 1.0.0
+description: |
+  Standard debugging workflow: search for error → read relevant code →
+  identify root cause → apply fix → run tests to verify.
+  Use when: fixing bugs, error messages, failing tests.
+
+tags: [debug, fix, error, bug, failing, test]
+
+steps:
+  - id: find_error
+    description: Search for the error message or failing location
+    tools: [grep, find_files]
+    prompt_hint: "Search for the error pattern. Use grep with the error message."
+
+  - id: read_context
+    description: Read the relevant source file around the error location
+    tools: [read_file]
+    prompt_hint: "Read the file where the error occurs. Use start_line/end_line to focus."
+
+  - id: identify_cause
+    description: Reason about the root cause without making changes yet
+    tools: []
+    prompt_hint: "Explain what you think is causing the error. Be specific about line numbers."
+
+  - id: apply_fix
+    description: Write the corrected code
+    tools: [write_file, append_file]
+    prompt_hint: "Apply the minimal fix. Don't rewrite more than needed."
+
+  - id: verify
+    description: Run tests to confirm fix works
+    tools: [bash]
+    prompt_hint: "Run the test command. Check exit code."
+
+success_criteria:
+  - "tests pass"
+  - "no error message"
+
+token_estimate: 15000
+max_steps: 10
+
+---
+# skills/builtin/grep_then_edit.yaml
+
+name: grep_then_edit
+version: 1.0.0
+description: |
+  Find all usages of a function/pattern, then update each one.
+  Use when: renaming, refactoring, updating API calls across codebase.
+
+tags: [refactor, rename, update, grep, find-replace]
+
+steps:
+  - id: find_all
+    description: Find all occurrences of the target pattern
+    tools: [grep, find_files]
+    prompt_hint: "Use grep to find all files and line numbers with the pattern."
+
+  - id: plan_changes
+    description: List all files that need changing
+    tools: []
+    prompt_hint: "List each file and what change is needed. Be explicit."
+
+  - id: apply_changes
+    description: Apply changes to each file
+    tools: [read_file, write_file]
+    prompt_hint: "For each file: read it, apply the change, write it back."
+
+  - id: verify
+    description: Confirm all occurrences are updated
+    tools: [grep, bash]
+    prompt_hint: "Grep again for old pattern — should be zero matches. Run tests."
+
+token_estimate: 12000
+max_steps: 15
+
+---
+# skills/builtin/test_and_fix.yaml
+
+name: test_and_fix
+version: 1.0.0
+description: |
+  Run tests, identify failures, fix them one by one.
+  Use when: making tests pass, CI is failing.
+
+tags: [test, ci, failing, pytest, jest, mocha]
+
+steps:
+  - id: run_tests
+    description: Run the test suite and capture output
+    tools: [bash]
+    prompt_hint: "Run the test command. Capture full output including failures."
+
+  - id: analyze_failures
+    description: Parse which tests are failing and why
+    tools: []
+    prompt_hint: "List each failing test with its error message and file location."
+
+  - id: fix_one
+    description: Fix the first failing test
+    tools: [read_file, grep, write_file]
+    prompt_hint: "Fix only the FIRST failing test. Don't touch passing tests."
+
+  - id: verify_one
+    description: Re-run tests to confirm first fix didn't break others
+    tools: [bash]
+    prompt_hint: "Run tests again. Check if the first failure is now passing."
+
+  - id: repeat_or_done
+    description: Repeat for remaining failures or signal done
+    tools: [task_done]
+    prompt_hint: "If all tests pass, signal done. Otherwise go back to fix_one."
+
+token_estimate: 18000
+max_steps: 20
