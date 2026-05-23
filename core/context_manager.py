@@ -35,18 +35,13 @@ def estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return int(len(enc.encode(text)) * 1.05)  # 5% safety
-    except ImportError:
-        # Fallback: character-based with calibration
-        char_count = len(text)
-        # Code tends to tokenize differently
-        code_chars = len(re.findall(r'[{}()\[\];=<>+\-*/\\|&^%$#@!~`]', text))
-        base = char_count / 3.8  # Llama tokenizer is slightly more efficient
-        code_penalty = code_chars * 0.1
-        return int((base + code_penalty) * 1.15)  # 15% over-estimate
+    # Calibrated char-based estimator — no network calls.
+    # Llama BPE averages ~3.8 chars/token for English code/text.
+    char_count = len(text)
+    code_chars = len(re.findall(r'[{}()\[\];=<>+\-*/\\|&^%$#@!~`]', text))
+    base = char_count / 3.8
+    code_penalty = code_chars * 0.1
+    return int((base + code_penalty) * 1.15)  # 15% safety over-estimate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -645,3 +640,23 @@ class ContextManager:
             tokens_used += t
             injected += 1
         return "\n".join(lines), injected
+
+# ── Ollama / small-model budget presets (appended) ──────────────────────────
+BUDGET_PRESETS["llama3.2:3b"] = ContextBudget(
+    total_context=4096, max_output=512,
+    system_prompt=200, tool_definitions=400,
+    active_memory=200, task_context=128,
+    conversation_history=1024, current_input=512,
+    safety_buffer=128,
+)
+BUDGET_PRESETS["llama3.2:1b"] = ContextBudget(
+    total_context=2048, max_output=256,
+    system_prompt=150, tool_definitions=250,
+    active_memory=128, task_context=64,
+    conversation_history=512, current_input=256,
+    safety_buffer=64,
+)
+BUDGET_PRESETS["llama3.1:8b"]   = BUDGET_PRESETS["llama-3.1-8b-instant"]
+BUDGET_PRESETS["mistral"]        = BUDGET_PRESETS["llama-3.1-70b-versatile"]
+BUDGET_PRESETS["gemma2:2b"]      = BUDGET_PRESETS["llama3.2:3b"]
+BUDGET_PRESETS["phi3:mini"]      = BUDGET_PRESETS["llama3.2:3b"]

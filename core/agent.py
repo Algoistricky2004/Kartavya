@@ -1,511 +1,742 @@
 """
-agent.py — The main agent harness runner.
+agent.py — Real harness engineering.
 
-This is the brain that ties together:
-  - Context management (small window engineering)
-  - Memory (tiered RAG-style)
-  - Observability (automated, no manual instrumentation)
-  - Loop detection (4 detectors)
-  - Hallucination detection
-  - Tool execution with permission checking
-  - Skill loading
+How Claude Code / Aider / OpenCode actually work:
+  1. Bootstrap: inject cwd, ls, git status, OS info BEFORE first LLM call
+  2. ReAct loop: Thought → Action (bash cmd) → Observation → repeat
+  3. Bash is the primary tool — find, grep, git, cat, ls — all bash
+  4. Small models (llama3.2:3b): ReAct text format, NOT XML/JSON tool schemas
+  5. Auto-complete: if task is satisfied by accumulated outputs, stop
+  6. Hard loop kill: force complete with best result on critical repeat
+  7. Persistent run memory: save results, inject similar past runs on step 1
 
-Designed so that a llama-3.1-8b-instant model can run effectively
-within its 8192-token context window on real engineering tasks.
+ReAct prompt format (works reliably on 3b models):
+  Thought: I need to find python files
+  Bash: find . -name "*.py" | grep -v __pycache__
+
+  → Agent sees: Observation: core/agent.py\ncli/main.py\n...
+
+  Thought: I have all files now
+  Done: core/agent.py\ncli/main.py\ntools/tools.py
+
+IMPORTANT: task_done is NOT a model tool for small models.
+  The harness detects "Done:" in model output and auto-completes.
 """
 
-import os
-import time
-import json
-import uuid
-import traceback
+import os, re, sys, time, json, uuid, traceback, hashlib, platform, subprocess
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 from pathlib import Path
 
-# Internal imports
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.context_manager import ContextManager, BUDGET_PRESETS
 from core.memory import MemoryStore, MemorySection, MemoryPriority
-from observability.observability import (
-    ObservabilityManager, EventType, AgentEvent
-)
-from providers.providers import get_provider, LLMProvider, LLMResponse
+from observability.observability import ObservabilityManager, EventType
+from providers.providers import (get_provider, LLMProvider, LLMResponse,
+                                 parse_tool_calls, REACT_ONLY_MODELS)
 from tools.tools import ToolRegistry, ToolResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# System Prompt — compressed for small context window
+# Environment Bootstrap — injected at step 1
+# Real harnesses do this. Model needs to know WHERE it is.
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT_TEMPLATE = """You are an AI agent assistant. Complete tasks step by step using tools.
+def build_env_context(max_chars: int = 800) -> str:
+    """
+    Build shell environment snapshot: cwd, top-level ls, git status, OS.
+    This goes into the system prompt so the model knows its environment.
+    """
+    lines = []
 
-TOOL FORMAT — emit tool calls as:
-<tool>TOOL_NAME</tool>
-<args>{{"arg1": "value1", "arg2": "value2"}}</args>
+    # OS + Python
+    lines.append(f"OS: {platform.system()} {platform.release()}")
+    lines.append(f"Python: {platform.python_version()}")
+
+    # CWD
+    cwd = os.getcwd()
+    lines.append(f"CWD: {cwd}")
+
+    # Top-level directory listing
+    try:
+        result = subprocess.run(
+            ["find", ".", "-maxdepth", "2", "-not", "-path", "*/__pycache__/*",
+             "-not", "-path", "*/.git/*", "-not", "-path", "*/node_modules/*",
+             "-not", "-name", "*.pyc"],
+            capture_output=True, text=True, timeout=5, cwd=cwd
+        )
+        entries = result.stdout.strip().splitlines()[:40]
+        lines.append(f"Files (top 40):\n" + "\n".join(entries))
+    except Exception:
+        try:
+            entries = [str(p) for p in Path(cwd).iterdir()][:20]
+            lines.append("Files:\n" + "\n".join(entries))
+        except Exception:
+            lines.append("Files: (unavailable)")
+
+    # Git status (if in a repo)
+    try:
+        git = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            capture_output=True, text=True, timeout=3, cwd=cwd
+        )
+        if git.returncode == 0:
+            lines.append(f"Git:\n{git.stdout.strip()[:200]}")
+    except Exception:
+        pass
+
+    ctx = "\n".join(lines)
+    if len(ctx) > max_chars:
+        ctx = ctx[:max_chars] + "\n...(truncated)"
+    return ctx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System prompts — one per model family
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ReAct format for small local models (llama3.2:3b, gemma2:2b, phi3:mini etc.)
+# These models DON'T reliably produce JSON tool calls.
+# They DO reliably produce Thought/Bash/Done when shown an example.
+REACT_SYSTEM = """\
+You are a shell agent. Complete tasks by running bash commands.
+
+ENVIRONMENT:
+{env_context}
+
+FORMAT — use EXACTLY this, one action per reply:
+Thought: what you need to do
+Bash: <the shell command>
+
+When you have the final answer:
+Thought: I have the answer
+Done: <paste the actual command output here>
 
 RULES:
-1. One tool call per response (small context window — be precise)
-2. After each tool result, decide: next tool or final answer
-3. If stuck (same result twice), try a different approach or report failure
-4. Never guess file contents — read them first
-5. Always verify before reporting success
-6. If you can't complete a task, say WHY clearly
-
-AGENT: {agent_id} | MODEL: {model} | STEP: {step}/{max_steps}
+- ONE Bash command per reply — nothing else
+- After Bash runs, you see the output — then decide next step
+- Write Done: only when you have the real answer from a command
+- NEVER repeat a Bash command you already ran — use the output you got
+- Step {step}/{max_steps}
 """
 
-# Compressed tool instruction (replaces verbose JSON schemas)
-TOOL_INSTRUCTION = """
-Use tools by emitting: <tool>name</tool><args>{{"key":"val"}}</args>
+# Full tool-calling system prompt for capable models (Claude, GPT-4, Groq)
+TOOL_SYSTEM = """\
+You are a coding agent. Complete tasks step-by-step using tools.
+
+ENVIRONMENT:
+{env_context}
+
+TOOL FORMAT (one tool per response, nothing else):
+<tool>tool_name</tool>
+<args>{{"key": "value"}}</args>
+
+AVAILABLE TOOLS: bash, read_file, write_file, find_files, list_dir, grep, task_done
+
+RULES:
+1. ONE tool per response
+2. After getting results — call task_done immediately with the actual output
+3. NEVER call the same tool twice with the same args — you already have the answer
+4. task_done output = real tool result, not a description
+5. Step {step}/{max_steps}
 """
+
+def _pick_system(model: str, env_context: str, step: int, max_steps: int) -> str:
+    is_react = any(m in model.lower() for m in REACT_ONLY_MODELS) or \
+               any(s in model.lower() for s in ["3b", "1b", "2b", "7b", "8b"])
+    template = REACT_SYSTEM if is_react else TOOL_SYSTEM
+    return template.format(env_context=env_context, step=step, max_steps=max_steps)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent Config
+# Persistent Run Memory
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RunMemory:
+    def __init__(self, run_dir: str = ".agent_os/runs"):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.session_file = self.run_dir / "session_memory.jsonl"
+        self._cache: dict = {}
+        self._load()
+
+    def _load(self):
+        if self.session_file.exists():
+            for line in self.session_file.read_text().splitlines():
+                try:
+                    rec = json.loads(line)
+                    key = self._key(rec.get("task", ""))
+                    self._cache[key] = rec
+                except Exception:
+                    pass
+
+    def _key(self, task: str) -> str:
+        return hashlib.md5(task.strip().lower().encode()).hexdigest()[:12]
+
+    def save_result(self, task: str, output: str, success: bool,
+                    steps: int, tokens: int, cost: float, duration_ms: float):
+        rec = {
+            "task": task, "output": output[:2000], "success": success,
+            "steps": steps, "tokens": tokens, "cost": round(cost, 6),
+            "duration_ms": round(duration_ms, 1),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        self._cache[self._key(task)] = rec
+        with open(self.session_file, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def get_similar(self, task: str, max_results: int = 2) -> list[dict]:
+        words = set(task.lower().split())
+        scored = []
+        for rec in self._cache.values():
+            prev = set(rec.get("task","").lower().split())
+            overlap = len(words & prev) / max(len(words), 1)
+            if overlap > 0.4:
+                scored.append((overlap, rec))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored[:max_results]]
+
+    def format_for_context(self, task: str) -> str:
+        similar = self.get_similar(task)
+        if not similar:
+            return ""
+        lines = ["[Similar past tasks:]"]
+        for r in similar[:2]:
+            icon = "✓" if r["success"] else "✗"
+            lines.append(f"{icon} Task: '{r['task'][:60]}'\n  Output: {r['output'][:150]}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task Intent Detector — knows when we already have the answer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TaskIntentDetector:
+    COMPLETION_MAP = {
+        "list":   ["bash", "find_files", "list_dir"],
+        "find":   ["bash", "find_files", "grep"],
+        "search": ["bash", "grep", "web_search"],
+        "show":   ["bash", "read_file", "find_files", "list_dir"],
+        "read":   ["bash", "read_file"],
+        "count":  ["bash", "find_files"],
+        "check":  ["bash", "read_file", "grep"],
+        "run":    ["bash"],
+        "execute":["bash"],
+        "git":    ["bash"],
+    }
+
+    # A result that is ONLY a shell command — not real output
+    _CMD_RE = re.compile(
+        r'^(find|ls|grep|cat|echo|python|pip|git|bash|sh|cd|rm|mv|cp|curl)\b',
+        re.IGNORECASE)
+
+    @classmethod
+    def _is_real_output(cls, result: str) -> bool:
+        """True if result is real command output, not a bare command string."""
+        stripped = result.strip()
+        has_newline = "\n" in stripped
+        has_path    = "/" in stripped or ".py" in stripped or ".yaml" in stripped
+        if cls._CMD_RE.match(stripped) and not has_newline and len(stripped) < 120:
+            return False
+        return has_newline or has_path or len(stripped) > 100
+
+    @classmethod
+    def is_satisfied(cls, task: str, tool_results: dict) -> tuple[bool, str]:
+        task_lower = task.lower().strip()
+        for verb, tools in cls.COMPLETION_MAP.items():
+            if task_lower.startswith(verb) or f" {verb} " in f" {task_lower} ":
+                for tool in tools:
+                    if tool in tool_results:
+                        result = tool_results[tool]
+                        if len(result) > 30 and cls._is_real_output(result):
+                            return True, result
+        # Short task + any substantial real output
+        if len(task.split()) <= 8:
+            for tool, result in tool_results.items():
+                if tool not in ("task_done",) and len(result) > 30:
+                    if cls._is_real_output(result):
+                        return True, result
+        return False, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config & Result
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentConfig:
-    agent_id: str            = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:6]}")
-    model: str               = "llama-3.1-8b-instant"
-    provider: str            = "groq"
-    max_steps: int           = 20          # per task
-    temperature: float       = 0.3         # low temp = more deterministic
-    max_tokens_per_call: int = 1024
-    memory_dir: str          = ".agent_os/memory"
-    audit_dir: str           = ".agent_os/audit"
-    allowed_tools: list[str] = field(default_factory=list)  # empty = all allowed
-    require_approval_for: list[str] = field(default_factory=lambda: [
-        "bash_destructive", "write_file", "delete_file"
-    ])
-    hallucination_threshold: float = 0.5   # flag if score > this
-    loop_break_on_warning: bool    = False  # True = break on warning (not just critical)
-    stream: bool                   = True
+    agent_id:             str   = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:6]}")
+    model:                str   = "llama-3.1-8b-instant"
+    provider:             str   = "groq"
+    max_steps:            int   = 20
+    temperature:          float = 0.1      # lower = more deterministic commands
+    max_tokens_per_call:  int   = 512
+    memory_dir:           str   = ".agent_os/memory"
+    audit_dir:            str   = ".agent_os/audit"
+    run_dir:              str   = ".agent_os/runs"
+    allowed_tools:        list  = field(default_factory=list)
+    require_approval_for: list  = field(default_factory=lambda: ["bash_destructive"])
+    hallucination_threshold: float = 0.6
+    stream:               bool  = False    # False for reliable token counts on Ollama
+    token_budget_usd:     float = None     # None = unlimited; set e.g. 0.10 for $0.10 cap
+    role:                 str   = "general" # agent role: general | researcher | coder | tester | reviewer
 
 
 @dataclass
 class TaskResult:
-    task_id: str
-    success: bool
-    output: str
-    steps_taken: int
-    tokens_used: int
-    cost_usd: float
-    duration_ms: float
-    trace_id: str
-    errors: list[str]
-    hallucination_flags: list[str]
-    loop_breaks: int
-    memory_entries_written: int
+    task_id:             str
+    success:             bool
+    output:              str
+    steps_taken:         int
+    tokens_used:         int
+    cost_usd:            float
+    duration_ms:         float
+    trace_id:            str
+    errors:              list
+    hallucination_flags: list
+    loop_breaks:         int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Agent
+# Agent
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Agent:
-    """
-    The core agent harness.
-
-    Usage:
-        agent = Agent(config=AgentConfig(model="llama-3.1-8b-instant"))
-        result = agent.run_task("Find and fix the failing test in src/tests/")
-    """
-
-    def __init__(self, config: AgentConfig = None, api_key: str = None):
+    def __init__(self, config: AgentConfig = None,
+                 api_key: str = None, ollama_host: str = None):
         self.config  = config or AgentConfig()
         self.obs     = ObservabilityManager(audit_dir=self.config.audit_dir)
         self.ctx     = ContextManager(model=self.config.model)
         self.memory  = MemoryStore(self.config.agent_id, self.config.memory_dir)
+        self.run_mem = RunMemory(self.config.run_dir)
         self.tools   = ToolRegistry(
-            allowed=self.config.allowed_tools or None,  # None = all
+            allowed=self.config.allowed_tools or None,
             require_approval=self.config.require_approval_for,
         )
+
+        env_key_map = {"groq":"GROQ_API_KEY","openai":"OPENAI_API_KEY",
+                       "anthropic":"ANTHROPIC_API_KEY","ollama":""}
+        resolved_key = api_key or os.environ.get(env_key_map.get(self.config.provider,""),"")
         self.provider: LLMProvider = get_provider(
-            self.config.provider, api_key=api_key or os.environ.get(
-                f"{self.config.provider.upper()}_API_KEY", ""
-            )
+            self.config.provider, api_key=resolved_key or None, host=ollama_host)
+
+        # Is this a tiny model that uses ReAct format?
+        self._is_react = (
+            self.config.model in REACT_ONLY_MODELS or
+            any(s in self.config.model.lower() for s in ["3b","1b","2b","7b","8b","mini"])
         )
-        self._approval_callback: Optional[Callable[[str, dict], bool]] = None
 
-    def set_approval_callback(self, callback: Callable[[str, dict], bool]):
-        """Register a function that handles human approval requests."""
-        self._approval_callback = callback
+        # Build env context once per session (cwd, files, git)
+        self._env_context = build_env_context()
 
-    # ── Main entry point ──────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # Main entry point
+    # ─────────────────────────────────────────────────────────────────────
 
-    def run_task(self, task: str, task_id: str = None,
-                 context_hint: str = "") -> TaskResult:
-        """
-        Run a task through the agent loop.
-        This is the main method — call this for everything.
-        """
+    def run_task(self, task: str, task_id: str = None) -> TaskResult:
         task_id    = task_id or uuid.uuid4().hex[:12]
         trace_id   = self.obs.new_trace()
         start_time = time.time()
 
-        # Observability: task start
-        task_span = self.obs.start_span(
-            "task", trace_id, agent_id=self.config.agent_id, task_id=task_id
-        )
-        self.obs.bus.emit_simple(
-            EventType.TASK_CREATED,
-            trace_id=trace_id,
-            agent_id=self.config.agent_id,
-            task_id=task_id,
-            metadata={"task": task[:200], "model": self.config.model},
-        )
+        past_ctx = self.run_mem.format_for_context(task)
 
-        # Memory: write task as high-priority entry
-        self.memory.upsert(
-            MemorySection.CURRENT_TASKS,
-            f"[ACTIVE] {task_id}: {task[:100]}",
-            priority=MemoryPriority.HIGH,
-            tags=[task_id],
-        )
+        self.memory.upsert(MemorySection.CURRENT_TASKS,
+                           f"[ACTIVE] {task_id}: {task[:100]}",
+                           priority=MemoryPriority.HIGH, tags=[task_id])
 
-        errors: list[str]           = []
-        hallucination_flags: list[str] = []
-        loop_breaks: int            = 0
-        step_count: int             = 0
-        total_tokens: int           = 0
-        total_cost: float           = 0.0
-        final_output: str           = ""
-        tool_results_for_hallcheck: dict[str, str] = {}
+        errors:              list  = []
+        hallucination_flags: list  = []
+        loop_breaks:         int   = 0
+        step_count:          int   = 0
+        total_tokens:        int   = 0
+        total_cost:          float = 0.0
+        final_output:        str   = ""
+        task_complete:       bool  = False
+        all_tool_results:    dict  = {}   # tool_name → output string
+
+        self.obs.bus.emit_simple(EventType.TASK_CREATED, trace_id=trace_id,
+                                 agent_id=self.config.agent_id, task_id=task_id,
+                                 metadata={"task": task[:200]})
 
         print(f"\n{'='*60}")
-        print(f"🦞 AGENT TASK START")
-        print(f"   ID:    {task_id}")
-        print(f"   Model: {self.config.model}")
-        print(f"   Task:  {task[:80]}...")
+        print(f"🚀 TASK  {task_id}")
+        print(f"   Model:    {self.config.model}  via  {self.config.provider}")
+        print(f"   Mode:     {'ReAct/bash' if self._is_react else 'tool-calling'}")
+        print(f"   Task:     {task}")
+        if past_ctx:
+            print(f"   💾 Similar past run found")
         print(f"{'='*60}")
 
+        task_span = self.obs.start_span("task", trace_id,
+                                        agent_id=self.config.agent_id, task_id=task_id)
+
         for step in range(1, self.config.max_steps + 1):
-            step_id   = f"{task_id}_s{step}"
-            step_span = self.obs.start_span(
-                f"step_{step}", trace_id, task_span.span_id,
-                self.config.agent_id, task_id
-            )
             step_count = step
+            step_span  = self.obs.start_span(f"step_{step}", trace_id, task_span.span_id,
+                                             self.config.agent_id, task_id)
             print(f"\n── Step {step}/{self.config.max_steps} ──")
 
+            # ── PRE-STEP: satisfied already? ──────────────────────────────
+            if step > 1:
+                satisfied, sat_result = TaskIntentDetector.is_satisfied(task, all_tool_results)
+                if satisfied:
+                    if self._is_react:
+                        # Tiny models: auto-complete — don't trust model to say Done
+                        print(f"   ✅ Auto-complete: have answer from tools")
+                        final_output  = sat_result
+                        task_complete = True
+                        self.obs.end_span(step_span)
+                        break
+                    # Capable models: inject hint but let model call task_done
+                    # (they might want to do more steps)
+
             try:
-                # ── Build context ─────────────────────────────────────────
-                system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                    agent_id=self.config.agent_id,
-                    model=self.config.model,
-                    step=step,
-                    max_steps=self.config.max_steps,
-                )
-                task_context = (
-                    f"Task: {task}\n"
-                    f"Step: {step}/{self.config.max_steps}\n"
-                    f"{'Hint: ' + context_hint if context_hint else ''}"
-                ).strip()
+                # ── 1. Build prompt ───────────────────────────────────────
+                system_prompt = _pick_system(
+                    self.config.model, self._env_context, step, self.config.max_steps)
 
-                # Memory: retrieve relevant chunks for current task
+                # Build current_input: task + accumulated observations
+                if step == 1:
+                    current_input = f"Task: {task}"
+                    if past_ctx:
+                        current_input += f"\n\n{past_ctx}"
+                else:
+                    # Show what the model already knows
+                    obs_lines = []
+                    for tool_name, result in list(all_tool_results.items())[-3:]:
+                        obs_lines.append(f"[{tool_name} output]:\n{result[:400]}")
+                    obs_block = "\n\n".join(obs_lines)
+                    current_input = (
+                        f"Task: {task}\n\n"
+                        f"Observations so far:\n{obs_block}\n\n"
+                        f"{'→ You have the answer — write Done: <output>' if self._is_react else '→ Call task_done if you have the answer, otherwise use next tool.'}"
+                    )
+
                 memory_chunks = self.memory.build_context_chunks(
-                    query=task, max_chunks=6, max_tokens=400
-                )
+                    query=task, max_chunks=2, max_tokens=150)
 
-                # Tools: only load tools relevant for current step
-                # (step-scoped to save tokens)
-                step_tools = self.tools.get_definitions_for_step(step, task)
+                # Tool definitions — only for capable models
+                step_tools = [] if self._is_react else \
+                             self.tools.get_definitions_for_step(step, task)
 
-                # User message = task description (step 1) or "continue" (later steps)
-                current_input = (
-                    f"Task: {task}"
-                    if step == 1
-                    else "Continue with the next step. What's your next action?"
-                )
-
-                messages, ctx_snapshot = self.ctx.build(
+                messages, ctx_snap = self.ctx.build(
                     system_prompt=system_prompt,
                     current_input=current_input,
-                    task_context=task_context,
+                    task_context=f"Step {step}/{self.config.max_steps}",
                     memory_chunks=memory_chunks,
                     tool_definitions=step_tools,
-                    step_hint=context_hint,
                 )
 
-                # Log context build
-                self.obs.bus.emit(AgentEvent(
-                    trace_id=trace_id,
-                    span_id=step_span.span_id,
-                    event_type=EventType.CONTEXT_BUILT.value,
-                    agent_id=self.config.agent_id,
-                    task_id=task_id,
-                    step_id=step_id,
-                    context_tokens=ctx_snapshot.total_tokens,
-                    context_headroom=ctx_snapshot.headroom_tokens,
-                    truncations=ctx_snapshot.truncations,
-                    metadata={
-                        "zones": ctx_snapshot.zones,
-                        "tools_loaded": ctx_snapshot.tools_loaded,
-                        "memory_chunks": ctx_snapshot.memory_chunks_injected,
-                        "summaries": ctx_snapshot.summaries_used,
-                    },
-                ))
+                print(f"   📦 ctx:{ctx_snap.total_tokens}tk "
+                      f"headroom:{ctx_snap.headroom_tokens}tk "
+                      f"tools:{len(step_tools)} mem:{ctx_snap.memory_chunks_injected}")
+                for t in ctx_snap.truncations:
+                    print(f"   ✂  {t}")
 
-                if ctx_snapshot.truncations:
-                    print(f"   📦 Context: {ctx_snapshot.total_tokens}tk "
-                          f"(headroom: {ctx_snapshot.headroom_tokens}tk) "
-                          f"| {len(ctx_snapshot.truncations)} truncation(s)")
-
-                # ── LLM call ──────────────────────────────────────────────
+                # ── 2. LLM call ───────────────────────────────────────────
                 llm_start = time.time()
-                self.obs.bus.emit_simple(
-                    EventType.LLM_CALL_START,
-                    trace_id=trace_id, agent_id=self.config.agent_id,
-                    task_id=task_id, model=self.config.model,
-                )
-
                 response: LLMResponse = self.provider.complete_with_retry(
                     messages=messages,
                     model=self.config.model,
                     max_tokens=self.config.max_tokens_per_call,
                     temperature=self.config.temperature,
                     stream=self.config.stream,
+                    tools=step_tools or None,
                 )
+                llm_ms = (time.time() - llm_start) * 1000
 
-                llm_duration = (time.time() - llm_start) * 1000
                 cost = self.obs.record_llm_call(
                     model=self.config.model,
                     tokens_in=response.tokens_in,
                     tokens_out=response.tokens_out,
-                    duration_ms=llm_duration,
+                    duration_ms=llm_ms,
                     task_id=task_id,
                     agent_id=self.config.agent_id,
                 )
                 total_tokens += response.tokens_in + response.tokens_out
                 total_cost   += cost
 
-                print(f"   🤖 LLM: {response.tokens_in}in/{response.tokens_out}out tk "
-                      f"| ${cost:.4f} | {llm_duration:.0f}ms")
+                # ── Token budget enforcement ──────────────────────────────────
+                if self.config.token_budget_usd and total_cost >= self.config.token_budget_usd:
+                    budget_msg = (f"Token budget ${self.config.token_budget_usd:.4f} reached "
+                                  f"(spent ${total_cost:.4f}). Stopping.")
+                    print(f"   ⚠️  BUDGET CAP: {budget_msg}")
+                    errors.append(budget_msg)
+                    if all_tool_results:
+                        final_output  = max(all_tool_results.values(), key=len)
+                        task_complete = True
+                    self.obs.end_span(step_span, status="error", error=budget_msg)
+                    break
 
-                # ── Hallucination check ───────────────────────────────────
-                h_score, h_flags = self.obs.analyze_hallucination(
-                    response.content, tool_results_for_hallcheck
-                )
-                if h_score > self.config.hallucination_threshold:
-                    flag_names = [f.kind for f in h_flags]
-                    hallucination_flags.extend(flag_names)
-                    print(f"   ⚠️  Hallucination score: {h_score:.2f} | flags: {flag_names}")
+                print(f"   🤖 {response.tokens_in}in/{response.tokens_out}out "
+                      f"| ${cost:.5f} | {llm_ms:.0f}ms")
 
-                # Print response preview
-                preview = response.content[:150].replace('\n', ' ')
-                print(f"   💬 Response: {preview}...")
+                # Show model's raw thought (first 200 chars)
+                preview = response.content[:200].replace('\n', ' ').strip()
+                if preview:
+                    print(f"   💬 {preview}")
 
-                # ── Tool execution ────────────────────────────────────────
-                tool_results_for_hallcheck = {}
+                # ── 3. Parse tool calls ───────────────────────────────────
+                tool_calls = response.tool_calls
+                if not tool_calls and response.content:
+                    tool_calls = parse_tool_calls(response.content)
+                    if tool_calls:
+                        print(f"   🔍 parsed from text: {tool_calls[0]['name']}")
 
-                if response.tool_calls:
-                    for tool_call in response.tool_calls:
-                        tool_name = tool_call["name"]
-                        tool_args = tool_call.get("args", {})
+                # ── 4. If no tool call — check if model gave final answer ─
+                if not tool_calls:
+                    content = response.content.strip()
+                    print(f"   [NO TOOL PARSED]")
 
-                        print(f"   🔧 Tool: {tool_name}({list(tool_args.keys())})")
+                    # For ReAct models: extract Bash/Done from raw text manually
+                    if self._is_react:
+                        extracted = _extract_react(content)
+                        if extracted:
+                            tool_calls = [extracted]
+                            print(f"   🔍 manual extract: {extracted['name']}")
 
-                        # Loop detection BEFORE tool call
-                        loop_result = self.obs.check_loop(tool_name, tool_args)
-                        if loop_result.stuck:
-                            print(f"   🔄 LOOP: [{loop_result.level}] {loop_result.message[:80]}")
-                            loop_breaks += 1
-                            if loop_result.level == "critical" or self.config.loop_break_on_warning:
-                                # Inject loop warning into next context
-                                self.ctx.record_turn(
-                                    current_input,
-                                    f"[LOOP BLOCKED] {loop_result.message}"
-                                )
-                                break  # Exit tool call loop, go to next step with warning
+                    # For all models: if content looks like a final answer, use it
+                    if not tool_calls and content:
+                        done_signals = [
+                            "here are", "found the following", "python files:",
+                            "the files are", "results:", "output:", "i found",
+                            ".py\n", ".py ",
+                        ]
+                        if any(s in content.lower() for s in done_signals):
+                            final_output  = content
+                            task_complete = True
+                            print(f"   ✅ Final answer detected in text")
+                            self.obs.end_span(step_span)
+                            break
 
-                        # Approval check
-                        if self._requires_approval(tool_name, tool_args):
-                            approved = self._request_approval(tool_name, tool_args, task_id)
-                            if not approved:
-                                result_str = f"[DENIED] Tool {tool_name} was not approved."
-                                print(f"   ❌ Approval denied for {tool_name}")
-                                self.ctx.record_turn(current_input, result_str)
-                                continue
-
-                        # Execute tool
-                        tool_span = self.obs.start_span(
-                            f"tool.{tool_name}", trace_id, step_span.span_id,
-                            self.config.agent_id, task_id
-                        )
-                        self.obs.bus.emit_simple(
-                            EventType.TOOL_CALL,
-                            trace_id=trace_id, agent_id=self.config.agent_id,
-                            task_id=task_id, metadata={"tool": tool_name, "args": tool_args},
-                        )
-
-                        tool_result: ToolResult = self.tools.execute(tool_name, tool_args)
-                        self.obs.record_tool(tool_name, tool_args, tool_result.output)
-
-                        # Store verified facts from tool results
-                        self.obs.hallucination.update_verified_fact(
-                            f"tool_{tool_name}_result",
-                            tool_result.output[:100],
-                            source=f"tool:{tool_name}",
-                        )
-                        tool_results_for_hallcheck[tool_name] = tool_result.output
-
-                        self.obs.end_span(
-                            tool_span,
-                            status="ok" if tool_result.success else "error",
-                            error=tool_result.error or "",
-                        )
-                        self.obs.bus.emit_simple(
-                            EventType.TOOL_RESULT,
-                            trace_id=trace_id, agent_id=self.config.agent_id,
-                            task_id=task_id,
-                            success=tool_result.success,
-                            metadata={"tool": tool_name, "output_len": len(tool_result.output)},
-                        )
-
-                        output_preview = tool_result.output[:80].replace('\n',' ')
-                        status_icon = "✓" if tool_result.success else "✗"
-                        print(f"   {status_icon} Result: {output_preview}...")
-
-                        # Update history with tool result
-                        self.ctx.record_turn(
-                            f"[Tool: {tool_name}({tool_args})]",
-                            f"[Result]: {tool_result.output[:200]}",
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                        )
-
-                        # Memory: save errors to avoid repeat mistakes
-                        if not tool_result.success and tool_result.error:
-                            self.memory.upsert(
-                                MemorySection.ERRORS_SEEN,
-                                f"{tool_name} failed: {tool_result.error[:100]}",
-                                priority=MemoryPriority.NORMAL,
-                                ttl_hours=2,
-                                tags=[task_id],
+                    # No progress — inject hint and continue
+                    if not tool_calls:
+                        if self._is_react:
+                            hint = (
+                                f"[No command detected. Reply with EXACTLY:\n"
+                                f"Thought: I need to find python files\n"
+                                f"Bash: find . -name \"*.py\" -not -path \"*/__pycache__/*\"]"
                             )
+                        else:
+                            hint = ("[No tool call detected. Use: "
+                                    "<tool>bash</tool>\\n<args>{\"command\":\"find . -name '*.py'\"}]</args>]")
+                        self.ctx.record_turn(current_input, hint)
+                        self.obs.end_span(step_span)
+                        continue
 
-                else:
-                    # No tool call — agent is giving a response/decision
-                    self.ctx.record_turn(current_input, response.content)
-                    final_output = response.content
+                # ── 5. Execute tool calls ─────────────────────────────────
+                for tc in tool_calls:
+                    tool_name = tc["name"]
+                    tool_args = tc.get("args", {})
 
-                    # Check if task is complete
-                    done_signals = [
-                        "task complete", "task completed", "done", "finished",
-                        "successfully", "i have completed", "the task is done",
-                        "here is the answer", "here's the answer",
-                    ]
-                    if any(sig in response.content.lower() for sig in done_signals):
-                        print(f"\n   ✅ Task completed at step {step}")
-                        # Update memory: task done
-                        self.memory.update_task_status(task_id, "DONE", response.content[:80])
+                    if "_parse_error" in tool_args:
+                        self.ctx.record_turn(current_input,
+                            "[Parse error. Write the command more simply.]")
+                        continue
+
+                    print(f"   🔧 {tool_name}({json.dumps(tool_args)[:100]})")
+
+                    # ── task_done ─────────────────────────────────────────
+                    if tool_name == "task_done":
+                        raw = (tool_args.get("output") or
+                               tool_args.get("summary") or "Task completed.")
+                        # If the model passed a shell command as the answer instead of
+                        # the actual result, replace it with the best real tool output.
+                        _looks_like_cmd = bool(re.match(
+                            r'^(find|ls|grep|cat|echo|python|pip|git|cd|bash|sh)',
+                            raw.strip()))
+                        if all_tool_results and (_looks_like_cmd or len(raw.strip()) < 80):
+                            raw = max(all_tool_results.values(), key=len, default=raw)
+                        final_output  = raw
+                        task_complete = True
+                        print(f"   ✅ task_done")
+                        print(f"\n   📋 OUTPUT:\n{final_output[:600]}\n")
+                        self.memory.update_task_status(task_id, "DONE", raw[:80])
                         self.obs.end_span(step_span)
                         break
 
-                self.obs.end_span(step_span)
+                    # ── Loop detection ────────────────────────────────────
+                    loop_r = self.obs.check_loop(tool_name, tool_args)
+                    if loop_r.stuck:
+                        loop_breaks += 1
+                        print(f"   🔄 LOOP [{loop_r.level}] count={loop_r.count}")
+                        if loop_r.level == "critical":
+                            if all_tool_results:
+                                final_output  = max(all_tool_results.values(), key=len)
+                                task_complete = True
+                                print(f"   ⛔ Hard kill → force complete")
+                                self.obs.end_span(step_span)
+                                break
+                            else:
+                                self.ctx.record_turn(current_input,
+                                    f"[BLOCKED: {tool_name} called {loop_r.count}x same args. "
+                                    f"Try a completely different command.]")
+                                break
+                        else:
+                            self.ctx.record_turn(current_input,
+                                f"[WARNING: {tool_name} repeated. "
+                                f"Use the output you already have, or run a different command.]")
+                            break
+
+                    # ── Approval ──────────────────────────────────────────
+                    if self._requires_approval(tool_name, tool_args):
+                        if not self._request_approval(tool_name, tool_args, task_id):
+                            self.ctx.record_turn(current_input,
+                                f"[DENIED: {tool_name}. Try another approach.]")
+                            continue
+
+                    # ── Execute ───────────────────────────────────────────
+                    tool_span = self.obs.start_span(
+                        f"tool.{tool_name}", trace_id, step_span.span_id,
+                        self.config.agent_id, task_id)
+
+                    tool_result: ToolResult = self.tools.execute(tool_name, tool_args)
+                    self.obs.record_tool(tool_name, tool_args, tool_result.output)
+                    self.obs.end_span(tool_span,
+                                      status="ok" if tool_result.success else "error",
+                                      error=tool_result.error or "")
+
+                    if tool_result.success and tool_result.output:
+                        # Key by tool_name + step so repeated bash calls don't overwrite
+                        result_key = tool_name if tool_name != "bash" else f"bash_{step}"
+                        all_tool_results[result_key] = tool_result.output
+                        # Also keep the canonical key updated (for intent detector compat)
+                        all_tool_results[tool_name] = tool_result.output
+                        self.obs.hallucination.update_verified_fact(
+                            f"{tool_name}_last", tool_result.output[:200],
+                            source=f"tool:{tool_name}")
+
+                    icon = "✓" if tool_result.success else "✗"
+                    print(f"   {icon} {tool_result.output[:200].replace(chr(10),' ')}")
+                    if tool_result.error:
+                        print(f"     ERR: {tool_result.error[:100]}")
+
+                    # ── Feed observation back — this is the harness loop ──
+                    # Model sees: what it ran + what happened
+                    if self._is_react:
+                        # ReAct format: Observation block
+                        if tool_result.success:
+                            observation = (
+                                f"Observation:\n{tool_result.output[:600]}\n\n"
+                                f"Now decide: is the task done? If yes write Done: <output>. "
+                                f"If not, write your next Thought: and Bash: command."
+                            )
+                        else:
+                            observation = (
+                                f"Observation: ERROR — {tool_result.error or 'command failed'}\n"
+                                f"Try a different command."
+                            )
+                    else:
+                        # Tool format: structured result
+                        if tool_result.success:
+                            observation = (
+                                f"[{tool_name} result]:\n{tool_result.output[:500]}\n\n"
+                                f"Tools used so far: {list(all_tool_results.keys())}\n"
+                                f"→ If this answers '{task[:60]}', call task_done with this output."
+                            )
+                        else:
+                            observation = (
+                                f"[{tool_name} FAILED]: {tool_result.error}\n"
+                                f"→ Try a different approach."
+                            )
+
+                    self.ctx.record_turn(f"[ran {tool_name}]", observation)
+
+                    # ── Immediate satisfaction check for tiny models ───────
+                    if self._is_react and tool_result.success:
+                        sat, sat_result = TaskIntentDetector.is_satisfied(
+                            task, all_tool_results)
+                        if sat:
+                            # Don't wait for model — complete now
+                            print(f"   ✅ Auto-complete: task satisfied by bash output")
+                            final_output  = sat_result
+                            task_complete = True
+                            self.obs.end_span(step_span)
+                            break
 
             except KeyboardInterrupt:
-                errors.append("User interrupted")
+                errors.append("interrupted by user")
                 self.obs.end_span(step_span, status="error", error="interrupted")
                 break
             except Exception as e:
-                error_msg = f"Step {step} error: {type(e).__name__}: {e}"
-                errors.append(error_msg)
-                print(f"   ❌ {error_msg}")
+                err = f"step {step} — {type(e).__name__}: {e}"
+                errors.append(err)
+                print(f"   ❌ {err}")
                 print(f"      {traceback.format_exc().splitlines()[-1]}")
-                self.obs.end_span(step_span, status="error", error=error_msg)
-                # Write error to memory so agent knows about it
-                self.memory.upsert(
-                    MemorySection.ERRORS_SEEN,
-                    f"step_{step} error: {error_msg[:100]}",
-                    priority=MemoryPriority.HIGH,
-                    ttl_hours=1,
-                )
+                self.obs.end_span(step_span, status="error", error=err)
+                self.memory.upsert(MemorySection.ERRORS_SEEN, err[:120],
+                                   priority=MemoryPriority.HIGH, ttl_hours=1)
+                # Fast-fail on fatal errors — no point retrying all 20 steps
+                fatal_signals = [
+                    "Failed to connect", "Connection refused", "ollama serve",
+                    "api_key", "401", "403", "ImportError", "ModuleNotFoundError",
+                ]
+                if any(sig.lower() in str(e).lower() for sig in fatal_signals):
+                    print(f"   🛑 Fatal error — stopping immediately (not retrying 20 steps)")
+                    break
                 continue
 
-        # ── Task complete ─────────────────────────────────────────────────
+            self.obs.end_span(step_span)
+
+            if task_complete:
+                break
+
+        # ── Wrap up ───────────────────────────────────────────────────────
         duration_ms = (time.time() - start_time) * 1000
-        success     = not bool(errors) and bool(final_output)
+        success     = task_complete and bool(final_output) and not errors
 
         self.obs.end_span(task_span, status="ok" if success else "error")
         self.obs.bus.emit_simple(
             EventType.TASK_COMPLETED if success else EventType.TASK_FAILED,
-            trace_id=trace_id,
-            agent_id=self.config.agent_id,
-            task_id=task_id,
-            success=success,
-            duration_ms=duration_ms,
-            metadata={
-                "steps": step_count,
-                "tokens": total_tokens,
-                "cost": total_cost,
-                "loops": loop_breaks,
-            },
-        )
+            trace_id=trace_id, agent_id=self.config.agent_id, task_id=task_id,
+            success=success, duration_ms=duration_ms,
+            metadata={"steps": step_count, "tokens": total_tokens, "cost": total_cost})
 
-        # Update memory: mark task status
-        self.memory.update_task_status(
-            task_id,
-            "DONE" if success else "FAILED",
-            final_output[:80] if final_output else (errors[-1][:80] if errors else ""),
-        )
+        if not task_complete:
+            self.memory.update_task_status(task_id, "INCOMPLETE",
+                                           f"hit max_steps={self.config.max_steps}")
+
+        self.run_mem.save_result(
+            task=task, output=final_output, success=success,
+            steps=step_count, tokens=total_tokens,
+            cost=total_cost, duration_ms=duration_ms)
 
         result = TaskResult(
-            task_id=task_id,
-            success=success,
-            output=final_output,
-            steps_taken=step_count,
-            tokens_used=total_tokens,
-            cost_usd=total_cost,
-            duration_ms=duration_ms,
-            trace_id=trace_id,
-            errors=errors,
-            hallucination_flags=hallucination_flags,
-            loop_breaks=loop_breaks,
-            memory_entries_written=len(self.memory.get_section(MemorySection.CURRENT_TASKS)),
+            task_id=task_id, success=success, output=final_output,
+            steps_taken=step_count, tokens_used=total_tokens,
+            cost_usd=total_cost, duration_ms=duration_ms,
+            trace_id=trace_id, errors=errors,
+            hallucination_flags=hallucination_flags, loop_breaks=loop_breaks,
         )
 
         print(f"\n{'='*60}")
-        print(f"{'✅ DONE' if success else '❌ FAILED'} | {step_count} steps | "
-              f"{total_tokens:,}tk | ${total_cost:.4f} | {duration_ms:.0f}ms")
+        icon = "✅ DONE" if success else ("⚠️  INCOMPLETE" if not errors else "❌ FAILED")
+        print(f"{icon} | {step_count} steps | {total_tokens:,}tk | "
+              f"${total_cost:.5f} | {duration_ms:.0f}ms")
         if errors:
-            print(f"   Errors: {'; '.join(errors[:2])}")
-        if hallucination_flags:
-            print(f"   Hallucination flags: {hallucination_flags}")
+            print(f"Errors: {'; '.join(errors[:2])}")
         print(f"{'='*60}\n")
 
         return result
 
-    # ── Private helpers ───────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _requires_approval(self, tool_name: str, args: dict) -> bool:
-        if tool_name in self.config.require_approval_for:
+    def _requires_approval(self, tool: str, args: dict) -> bool:
+        if tool in self.config.require_approval_for:
             return True
-        # Check for dangerous patterns in args
-        args_str = json.dumps(args).lower()
-        dangerous = ["production", "prod-db", "rm -rf", "drop table",
-                     "delete from", "truncate"]
-        return any(d in args_str for d in dangerous)
+        args_s = json.dumps(args).lower()
+        return any(d in args_s for d in ["rm -rf /", "format c:", "drop table",
+                                          "truncate", "--force --all"])
 
-    def _request_approval(self, tool_name: str, args: dict, task_id: str) -> bool:
-        self.obs.bus.emit_simple(
-            EventType.BUDGET_THRESHOLD,
-            task_id=task_id,
-            agent_id=self.config.agent_id,
-            metadata={"tool": tool_name, "args": args, "reason": "approval_required"},
-        )
-        if self._approval_callback:
-            return self._approval_callback(tool_name, args)
-        # Default: ask in terminal
-        print(f"\n   ⚠️  APPROVAL REQUIRED")
-        print(f"   Tool: {tool_name}")
-        print(f"   Args: {json.dumps(args, indent=4)}")
-        resp = input("   Approve? (y/n): ").strip().lower()
-        return resp in ("y", "yes")
+    def _request_approval(self, tool: str, args: dict, task_id: str) -> bool:
+        if hasattr(self, "_approval_cb") and self._approval_cb:
+            return self._approval_cb(tool, args)
+        print(f"\n   ⚠️  APPROVAL REQUIRED: {tool}({json.dumps(args)[:100]})")
+        try:
+            return input("   Approve? (y/n): ").strip().lower() in ("y","yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
 
     def get_trace(self, trace_id: str) -> str:
         return self.obs.tracer.format_trace(trace_id)
@@ -515,3 +746,43 @@ class Agent:
 
     def memory_export(self) -> str:
         return self.memory.export_markdown()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ReAct extractor — last-resort manual parse for llama3.2:3b
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_react(content: str) -> Optional[dict]:
+    """
+    Manually extract Bash or Done from model text when the regex parser misses it.
+    Handles llama3.2:3b's inconsistent output formatting.
+    """
+    lines = content.strip().splitlines()
+
+    # Scan line by line for patterns
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Bash command
+        if re.match(r'^(Bash|Action|Command)\s*:', stripped, re.IGNORECASE):
+            cmd = re.sub(r'^(Bash|Action|Command)\s*:\s*', '', stripped, flags=re.IGNORECASE).strip()
+            cmd = cmd.strip('`').strip()
+            # Check next line for multi-line command (code block)
+            if not cmd and i + 1 < len(lines):
+                cmd = lines[i+1].strip().strip('`')
+            if cmd:
+                return {"name": "bash", "args": {"command": cmd}}
+
+        # Done / Final answer
+        if re.match(r'^(Done|Answer|Final|Result)\s*:', stripped, re.IGNORECASE):
+            answer = re.sub(r'^(Done|Answer|Final|Result)\s*:\s*', '', stripped,
+                            flags=re.IGNORECASE).strip()
+            # Collect remaining lines as part of answer
+            if i + 1 < len(lines):
+                answer = answer + "\n" + "\n".join(lines[i+1:])
+            answer = answer.strip()
+            if answer:
+                return {"name": "task_done",
+                        "args": {"summary": answer[:100], "output": answer}}
+
+    return None

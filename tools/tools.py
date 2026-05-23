@@ -88,6 +88,9 @@ class ToolRegistry:
             return True
         return tool_name in self._allowed
 
+    def all_tool_names(self) -> list[str]:
+        return list(self._tool_handlers.keys())
+
     def requires_approval(self, tool_name: str) -> bool:
         return tool_name in self._require_approval
 
@@ -309,6 +312,32 @@ class ToolRegistry:
             },
         }
         return definitions.get(tool_name, {"name": tool_name, "description": "", "parameters": {}})
+    def get_definition(self, allowed=None) -> list[dict]:
+        """
+        Return tool schemas formatted for LLM tool/function calling.
+        """
+
+        tool_names = list(self._tool_handlers.keys())
+
+        # Filter allowed tools
+        if allowed:
+            tool_names = [
+                name for name in tool_names
+                if name in allowed
+            ]
+
+        defs = []
+
+        for name in tool_names:
+            tool_def = self._get_definition(name)
+
+            if tool_def:
+                defs.append({
+                    "type": "function",
+                    "function": tool_def,
+                })
+
+        return defs
 
     # ── Tool implementations ───────────────────────────────────────────────
 

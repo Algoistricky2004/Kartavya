@@ -1,8 +1,11 @@
-groq>=0.9.0
-# optional providers (uncomment as needed)
-# openai>=1.0.0
-# anthropic>=0.25.0
-# optional: for accurate token counting
-# tiktoken>=0.7.0
+# Core — at least one provider required
+groq>=0.9.0            # cloud, fast, free tier — recommended for dev
+anthropic>=0.40.0      # claude — best for complex tasks
+openai>=1.0.0          # gpt-4o-mini
 
-# standard library only otherwise — no heavy dependencies
+# Local (optional)
+ollama>=0.2.0          # llama3.2, gemma, phi3 — free, offline
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0.0          # skill registry YAML loading
