@@ -601,17 +601,29 @@ class ContextManager:
         """
         Build compressed tool definitions within budget.
         Uses terse format instead of full JSON schema.
+
+        Handles both formats from tools.py:
+          Flat:    {"name": "bash", "description": "...", "parameters": {...}}
+          Wrapped: {"type": "function", "function": {"name": "bash", ...}}
         """
         lines = []
         loaded = []
         tokens_used = 0
         for tool in tools:
-            name = tool.get("name", "unknown")
-            desc = tool.get("description", "")[:100]
-            params = tool.get("parameters", {}).get("properties", {})
+            # Unwrap {"type":"function","function":{...}} if needed — this is the
+            # format returned by ToolRegistry.get_definition(). Without this unwrap,
+            # tool.get("name") always returns "unknown" because the name is nested.
+            fn = tool.get("function", tool)
+            name = fn.get("name", "")
+            if not name:
+                continue
+            desc = fn.get("description", "")[:100]
+            params_schema = fn.get("parameters", {})
+            props = params_schema.get("properties", {})
+            required = set(params_schema.get("required", []))
             param_summary = ", ".join(
-                f"{k}({'req' if k in (tool.get('parameters',{}).get('required',[]) or []) else 'opt'})"
-                for k in list(params.keys())[:6]
+                f"{k}({'req' if k in required else 'opt'})"
+                for k in list(props.keys())[:6]
             )
             line = f"- {name}({param_summary}): {desc}"
             t = estimate_tokens(line)

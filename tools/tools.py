@@ -22,9 +22,23 @@ import json
 import time
 import subprocess
 import fnmatch
+import platform
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
+
+# Directories to always skip when searching files (avoids 700+ venv results)
+_EXCLUDED_DIRS = frozenset({
+    '__pycache__', '.git', '.hg', '.svn',
+    'node_modules', 'bower_components',
+    'venv', '.venv', 'env', 'virtualenv',
+    'site-packages', 'dist-packages',
+    'dist', 'build', 'target', '.eggs', '.tox',
+    '.pytest_cache', '.mypy_cache', '.ruff_cache',
+    '.idea', '.vscode',
+})
+
+_IS_WINDOWS = platform.system() == "Windows"
 
 
 @dataclass
@@ -341,6 +355,30 @@ class ToolRegistry:
 
     # ── Tool implementations ───────────────────────────────────────────────
 
+    @staticmethod
+    def _win_translate(command: str) -> str:
+        """Translate common Unix commands to Windows equivalents."""
+        if not _IS_WINDOWS:
+            return command
+        cmd = command.strip()
+        # python3 -> python (most important on Windows)
+        cmd = re.sub(r'\bpython3\b', 'python', cmd)
+        # ls -> dir
+        if re.match(r'^ls(-la?|-al?)?\s*$', cmd):
+            return 'dir'
+        # pwd -> cd
+        if cmd == 'pwd':
+            return 'cd'
+        # cat file -> type file
+        m = re.match(r'^cat\s+(.+)', cmd)
+        if m:
+            return f'type {m.group(1)}'
+        # which cmd -> where cmd
+        m = re.match(r'^which\s+(\S+)', cmd)
+        if m:
+            return f'where {m.group(1)}'
+        return cmd
+
     def _bash(self, args: dict) -> ToolResult:
         command = args.get("command", "")
         if not command:
@@ -348,6 +386,9 @@ class ToolRegistry:
 
         timeout = int(args.get("timeout", 30))
         cwd     = args.get("cwd", os.getcwd())
+
+        # Translate common Unix commands to Windows equivalents
+        command = self._win_translate(command)
 
         # Safety: block most destructive commands
         dangerous = ["rm -rf /", "format", "mkfs", ":(){:|:&};:"]
@@ -503,21 +544,34 @@ class ToolRegistry:
             return ToolResult(success=False, output="", error=str(e))
 
     def _find_files(self, args: dict) -> ToolResult:
-        pattern    = args.get("pattern", "*")
-        directory  = args.get("directory", ".")
+        pattern     = args.get("pattern", "*")
+        directory   = args.get("directory", ".")
         max_results = int(args.get("max_results", 20))
         try:
-            p = Path(directory)
+            p = Path(directory).resolve()
             matches = []
             for item in p.rglob("*"):
-                if fnmatch.fnmatch(item.name, pattern) and item.is_file():
-                    matches.append(str(item.relative_to(p)))
+                if not item.is_file():
+                    continue
+                try:
+                    rel = item.relative_to(p)
+                except ValueError:
+                    continue
+                # Skip non-project dirs: venv, __pycache__, .git, node_modules…
+                if any(part in _EXCLUDED_DIRS for part in rel.parts[:-1]):
+                    continue
+                if fnmatch.fnmatch(item.name, pattern):
+                    matches.append(str(rel))
                     if len(matches) >= max_results:
                         break
             if not matches:
-                return ToolResult(success=True, output=f"No files matching '{pattern}' in {directory}")
-            return ToolResult(success=True,
-                              output=f"{len(matches)} file(s) matching '{pattern}':\n" + "\n".join(sorted(matches)))
+                return ToolResult(success=True,
+                                  output=f"No files matching '{pattern}' in {directory}")
+            return ToolResult(
+                success=True,
+                output=f"{len(matches)} file(s) matching '{pattern}':\n"
+                       + "\n".join(sorted(matches)),
+            )
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 

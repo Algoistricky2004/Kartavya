@@ -169,10 +169,14 @@ def _build_system_prompt(
     # ── Operating principles (SLM = minimal) ─────────────────────────────────
     if is_slm:
         lines += [
-            "Rules:",
-            "1. Use tools to gather facts before making claims.",
-            "2. One action per step. Check the result before the next.",
-            "3. Stop when the task is done. Signal with Done: <answer>",
+            "## CRITICAL RULES — READ BEFORE ANYTHING ELSE",
+            "",
+            "1. NEVER answer from memory or training data.",
+            "   You MUST use tools (find_files, read_file, grep) to read actual files first.",
+            "2. If the user message contains [FILE CONTENT] blocks, use ONLY those to answer.",
+            "3. If no file content is provided yet, your FIRST action must be find_files or read_file.",
+            "4. One tool call per reply. Format: Thought: ... then Bash: <python command> OR Done: <answer>",
+            "5. Write Done: ONLY after you have read actual file content — not before.",
             "",
         ]
     else:
@@ -576,8 +580,48 @@ class AgentOS:
         errors: list[str] = []
         step = 0
 
-        # Initial user message
-        current_input = intake.task
+        # ── PRE-BOOTSTRAP: run tool calls BEFORE first LLM call ────────────────
+        # This is the Claude Code approach: ground the model in REAL file content
+        # BEFORE asking it anything. Never let a small model answer from memory.
+        bootstrap_ctx = self._pre_bootstrap(intake, run_state.route_config)
+        if bootstrap_ctx:
+            current_input = (
+                f"Task: {intake.task}\n\n"
+                f"I already ran find_files and read_file to get real context. "
+                f"Here is the ACTUAL file content from this repository:\n\n"
+                f"{bootstrap_ctx}\n\n"
+                f"Answer the task using ONLY the file content above. "
+                f"Do not use your training data. "
+                f"If you have enough information, write Done: <your answer>. "
+                f"If you need more files, call read_file."
+            )
+        else:
+            current_input = (
+                f"Task: {intake.task}\n\n"
+                f"Start by calling find_files to locate relevant files. "
+                f"Do NOT answer from memory."
+            )
+
+        # ── DIRECT ANSWER MODE ───────────────────────────────────────────────
+        # For research tasks where we already have file content from pre-bootstrap,
+        # there's NO reason to run a ReAct loop. The loop format confuses small models
+        # into trying to execute "Done:" as a bash command.
+        #
+        # Instead: one clean LLM call with the content → get the answer → done.
+        # This is the correct architecture: deterministic tool phase, then pure reasoning.
+        if bootstrap_ctx and intake.task_type.value in ("research", "mixed"):
+            direct_result = self._direct_answer(
+                task=intake.task,
+                context=bootstrap_ctx,
+                config=config,
+                run_state=run_state,
+            )
+            if direct_result is not None:
+                run_state.final_output = direct_result.output
+                run_state.done = True
+                run_state.steps_taken = direct_result.steps_taken
+                run_state.tokens_in  += direct_result.tokens_used  # rough
+                return direct_result
 
         while step < config.step_limit:
             step += 1
@@ -902,6 +946,157 @@ class AgentOS:
         print(f"{'─'*62}\n")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Pre-execution bootstrap (Claude Code style grounding)
+
+    def _pre_bootstrap(self, intake, route_config) -> str:
+        """
+        Run tool calls DETERMINISTICALLY before the first LLM call.
+
+        This is how Claude Code works: it ALWAYS reads real files before
+        asking the model anything. The model reasons over actual content, not memory.
+
+        Returns a formatted context string injected into the first user message.
+        """
+        import re as _re
+        lines = []
+
+        # Step 1: list the working directory
+        dir_r = self._tools.execute("list_dir", {"path": "."})
+        if dir_r.success and dir_r.output:
+            lines.append(f"[DIRECTORY LISTING]\n{dir_r.output[:500]}")
+
+        # Step 2: find files matching task keywords
+        keywords = self._task_to_file_keywords(intake)
+        found_paths = []
+        for kw in keywords[:4]:
+            fr = self._tools.execute("find_files", {
+                "pattern": f"*{kw}*.py", "directory": ".", "max_results": 5
+            })
+            if fr.success and "file(s)" in fr.output:
+                lines.append(f"[find_files '*{kw}*.py']\n{fr.output[:300]}")
+                for fline in fr.output.splitlines()[1:]:
+                    fp = fline.strip()
+                    if fp and fp not in found_paths:
+                        found_paths.append(fp)
+
+        # Step 3: read the most relevant files (up to 3)
+        kw_lower = [k.lower() for k in keywords]
+        def relevance(path):
+            p = path.lower().replace("\\", "/")
+            name = p.split("/")[-1].replace(".py", "")
+            return sum(2 if k == name else 1 if k in p else 0 for k in kw_lower)
+
+        found_paths.sort(key=relevance, reverse=True)
+
+        for fpath in found_paths[:3]:
+            rr = self._tools.execute("read_file", {"path": fpath})
+            if rr.success and rr.output:
+                max_chars = 3000 if intake.task_type.value == "research" else 1500
+                preview = rr.output[:max_chars]
+                if len(rr.output) > max_chars:
+                    preview += f"\n... [{len(rr.output) - max_chars} chars truncated]"
+                lines.append(f"[FILE: {fpath}]\n{preview}")
+
+        return "\n\n".join(lines)
+
+    def _task_to_file_keywords(self, intake) -> list:
+        """Extract keywords from task that map to filenames."""
+        import re as _re
+        keywords = []
+        keywords.extend([
+            r.replace(".py", "").replace("/", "_").replace("\\", "_")
+            for r in intake.file_refs[:3]
+        ])
+        keywords.extend(intake.entities[:3])
+        skip = {
+            "find", "show", "list", "read", "what", "explain", "describe",
+            "how", "does", "work", "this", "that", "with", "from", "make",
+            "give", "help", "just", "need", "want", "know", "tell", "look",
+            "module", "file", "code", "class", "function", "method", "into",
+        }
+        words = _re.findall(r"\b[a-z][a-z_]{3,}\b", intake.task.lower())
+        keywords.extend([w for w in words if w not in skip][:4])
+        return list(dict.fromkeys(keywords))
+
+    def _direct_answer(self, task: str, context: str,
+                        config, run_state) -> "TaskResult | None":
+        """
+        One-shot answer for research tasks that already have file content.
+
+        Architecture:
+          - Tool phase (done by _pre_bootstrap): find files, read them
+          - Reason phase (this method): give content to LLM, get answer
+
+        No ReAct loop. No Bash. No Done: confusion.
+        The model just reads and explains.
+        """
+        import time as _time
+        import uuid as _uuid
+
+        system = (
+            "You are an expert software engineer. "
+            "You will be given actual source code files and asked to explain or analyze them. "
+            "Base your answer ONLY on the provided file content. "
+            "Be specific: mention class names, method names, line numbers where relevant. "
+            "Write clear prose — no need for special formatting or commands."
+        )
+
+        user_msg = (
+            f"Here is the actual source code from the repository:\n\n"
+            f"{context}\n\n"
+            f"---\n\n"
+            f"Question: {task}\n\n"
+            f"Answer based on the code above:"
+        )
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_msg},
+        ]
+
+        t0 = _time.time()
+        try:
+            response = self._provider.complete_with_retry(
+                messages=messages,
+                model=config.model,
+                max_tokens=config.spec.max_output,
+                temperature=0.1,   # low temp for factual explanation
+                stream=False,      # must be False to get full answer at once
+                tools=None,        # no tools — pure reasoning
+            )
+        except Exception as e:
+            print(f"  ⚠️  direct_answer LLM error: {e}")
+            return None
+
+        dur = (_time.time() - t0) * 1000
+        cost = self._obs.record_llm_call(
+            config.model, response.tokens_in, response.tokens_out,
+            dur, task_id=run_state.task_id, agent_id=self.config.agent_id,
+        )
+        run_state.cost_usd += cost
+
+        answer = (response.content or "").strip()
+        if not answer:
+            return None
+
+        print(f"\n  ── Direct Answer (1 call, {response.tokens_in + response.tokens_out}tk) ──")
+        print("  " + answer[:300].replace("\n", "\n  "))
+
+        return TaskResult(
+            task_id=run_state.task_id,
+            task_text=task,
+            success=True,
+            output=answer,
+            steps_taken=1,
+            tokens_used=response.tokens_in + response.tokens_out,
+            cost_usd=cost,
+            duration_ms=dur,
+            trace_id="",
+            errors=[],
+            skill_used=run_state.skill_match.skill.name if run_state.skill_match else "",
+            verify_status="pass",
+        )
+
     # Dashboard & export
     # ─────────────────────────────────────────────────────────────────────────
 

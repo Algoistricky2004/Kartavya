@@ -40,17 +40,25 @@ class LLMProvider(ABC):
     def list_models(self) -> list[str]: ...
 
     def complete_with_retry(self, messages, model, max_retries=3, **kwargs) -> LLMResponse:
+        """
+        Retry wrapper with exponential backoff for rate limits (429) and transient errors.
+        Groq SDK's own retry is disabled (max_retries=0) so we fully control timing here.
+        """
         last_error = None
         for attempt in range(max_retries):
             try:
                 return self.complete(messages, model, **kwargs)
             except Exception as e:
                 last_error = e
-                if any(x in str(e).lower() for x in ("rate_limit","429","503","500")):
-                    wait = 2 ** attempt
-                    print(f"   ⟳ retry {attempt+1}/{max_retries} in {wait}s: {e}")
+                err_str = str(e).lower()
+                # Retryable: rate limit, server errors, connection issues
+                if any(x in err_str for x in ("rate_limit", "429", "503", "500",
+                                               "connection", "timeout", "overloaded")):
+                    wait = min(30, 2 ** attempt + 1)  # cap at 30s
+                    print(f"   ⟳ retry {attempt+1}/{max_retries} in {wait}s ({type(e).__name__})")
                     time.sleep(wait)
                 else:
+                    # Non-retryable: auth errors, bad requests, etc.
                     raise
         raise last_error
 
@@ -63,59 +71,66 @@ def parse_tool_calls(content: str) -> list[dict]:
     """
     Parse tool calls from model text output.
 
-    Formats handled (in priority order):
-      1. ReAct Bash block:  Bash:\n```\ncommand\n```   → bash tool
-      2. ReAct Bash inline: Bash: command              → bash tool  
-      3. ReAct Done:        Done: answer               → task_done tool
-      4. XML <tool>/<args>  (original format)
-      5. Raw JSON {\"name\":...,\"arguments\":...}
+    Priority: Done/Answer > Bash block > Bash inline > XML > JSON
+
+    Critical fix for llama3.2:3b: it writes "Bash:\n  Done: answer" or
+    "Bash:\n  Done:" (empty). Both must resolve to task_done, not bash.
     """
-    tool_calls = []
     c = content.strip()
 
-    # ── Format 1: Bash code block (most reliable for small models)
-    # Matches:
-    #   Bash:
-    #   ```
-    #   find . -name "*.py"
-    #   ```
-    m = re.search(r'(?:Bash|Action|Command)\s*:\s*\n```(?:bash|shell|sh)?\s*\n(.*?)\n```',
-                  c, re.DOTALL | re.IGNORECASE)
+    # ── PRIORITY 1: Done/Answer signal — always checked first ────────────────
+    done_m = re.search(
+        r'(?:^|\n)\s*(?:Done|Answer|Final|Result)\s*:\s*(.*)',
+        c, re.IGNORECASE | re.DOTALL
+    )
+    if done_m:
+        answer = done_m.group(1).strip()
+        # Empty Done: → extract Thought content as the answer
+        if not answer:
+            thought_m = re.search(r'(?:Thought|Observation)\s*:\s*(.+)',
+                                   c[:done_m.start()], re.DOTALL | re.IGNORECASE)
+            before = c[:done_m.start()].strip()
+            answer = thought_m.group(1).strip() if thought_m else before
+        # Reject if answer is another ReAct token
+        if answer and not re.match(r'^(Bash|Action|Command|Thought)\s*:', answer, re.I):
+            # Trim trailing ReAct lines that got captured by DOTALL
+            answer = re.split(r'\n(?:Bash|Action|Thought|Command)\s*:', answer)[0].strip()
+            if answer:
+                return [{"name": "task_done",
+                         "args": {"output": answer, "summary": answer[:120]}}]
+
+    # ── Format 1: Bash code block ─────────────────────────────────────────────
+    m = re.search(
+        r'(?:Bash|Action|Command)\s*:\s*\n```(?:bash|shell|sh|cmd)?\s*\n(.*?)\n```',
+        c, re.DOTALL | re.IGNORECASE
+    )
     if m:
         cmd = m.group(1).strip()
-        if cmd:
+        if cmd and not re.match(r'^(Done|Answer|Final|Thought|Result)\s*:', cmd, re.I):
             return [{"name": "bash", "args": {"command": cmd}}]
 
-    # ── Format 2: Bash inline (single line)
-    # Matches: Bash: find . -name "*.py"
-    #          Action: ls -la
+    # ── Format 2: Bash inline (single line) ───────────────────────────────────
     m = re.search(r'^(?:Bash|Action|Command)\s*:\s*(.+)$', c,
                   re.MULTILINE | re.IGNORECASE)
     if m:
         cmd = m.group(1).strip().strip('`')
-        if cmd and not cmd.startswith('{'):
+        if (cmd and not cmd.startswith('{')
+                and not re.match(r'^(Done|Answer|Final|Result|Thought)\s*:', cmd, re.I)):
             return [{"name": "bash", "args": {"command": cmd}}]
 
-    # ── Format 3: Done / Answer / Final
-    # Matches: Done: <answer>
-    #          Answer: <answer>
-    #          Final: <answer>
-    m = re.search(r'^(?:Done|Answer|Final|Result)\s*:\s*(.+)',
-                  c, re.MULTILINE | re.IGNORECASE | re.DOTALL)
-    if m:
-        answer = m.group(1).strip()
-        if answer:
-            return [{"name": "task_done", "args": {"summary": answer[:100], "output": answer}}]
-
-    # ── Format 4: XML <tool>/<args>
-    m = re.search(r'<tool>\s*([\w_]+)\s*</tool>\s*(?:<args>)?\s*(\{.*?\})\s*(?:</args>)?',
-                  c, re.DOTALL)
+    # ── Format 3: XML <tool>/<args> ───────────────────────────────────────────
+    m = re.search(
+        r'<tool>\s*([\w_]+)\s*</tool>\s*(?:<args>)?\s*(\{.*?\})\s*(?:</args>)?',
+        c, re.DOTALL
+    )
     if m:
         return [{"name": m.group(1).strip(), "args": _safe_json(m.group(2))}]
 
-    # ── Format 5: Raw JSON tool call
-    m = re.search(r'\{"name"\s*:\s*"([\w_]+)"\s*,\s*"(?:args|arguments|parameters)"\s*:\s*(\{.*?\})\s*\}',
-                  c, re.DOTALL)
+    # ── Format 4: Raw JSON tool call ──────────────────────────────────────────
+    m = re.search(
+        r'\{"name"\s*:\s*"([\w_]+)"\s*,\s*"(?:args|arguments|parameters)"\s*:\s*(\{.*?\})\s*\}',
+        c, re.DOTALL
+    )
     if m:
         return [{"name": m.group(1), "args": _safe_json(m.group(2))}]
 
@@ -151,7 +166,10 @@ class GroqProvider(LLMProvider):
         key = api_key or os.environ.get("GROQ_API_KEY", "")
         if not key:
             raise ValueError("GROQ_API_KEY not set.")
-        self._client = Groq(api_key=key)
+        # max_retries=0 disables Groq SDK's own retry/sleep loop.
+        # Without this, a 429 causes Groq to sleep internally for up to 60s,
+        # which feels like a hang. We handle retries ourselves in complete_with_retry().
+        self._client = Groq(api_key=key, max_retries=0)
 
     def complete(self, messages, model=None, max_tokens=1024, temperature=0.7,
                  stream=True, tools=None) -> LLMResponse:

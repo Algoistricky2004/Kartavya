@@ -45,46 +45,65 @@ from tools.tools import ToolRegistry, ToolResult
 
 def build_env_context(max_chars: int = 800) -> str:
     """
-    Build shell environment snapshot: cwd, top-level ls, git status, OS.
-    This goes into the system prompt so the model knows its environment.
+    Build shell environment snapshot: cwd, top-level files, git status, OS.
+    Uses pure Python (no Unix find command) so it works on Windows too.
     """
+    import platform
     lines = []
 
-    # OS + Python
-    lines.append(f"OS: {platform.system()} {platform.release()}")
+    # OS + Python version
+    os_name = platform.system()
+    lines.append(f"OS: {os_name} {platform.release()}")
     lines.append(f"Python: {platform.python_version()}")
 
     # CWD
     cwd = os.getcwd()
     lines.append(f"CWD: {cwd}")
 
-    # Top-level directory listing
+    # Directory listing — pure Python, works on Windows and Unix
+    _excluded = {
+        '__pycache__', '.git', '.hg', '.svn', 'node_modules',
+        'venv', '.venv', 'env', 'virtualenv',
+        'site-packages', 'dist-packages', '.tox', 'dist', 'build',
+        '.pytest_cache', '.mypy_cache', '.eggs',
+    }
     try:
-        result = subprocess.run(
-            ["find", ".", "-maxdepth", "2", "-not", "-path", "*/__pycache__/*",
-             "-not", "-path", "*/.git/*", "-not", "-path", "*/node_modules/*",
-             "-not", "-name", "*.pyc"],
-            capture_output=True, text=True, timeout=5, cwd=cwd
-        )
-        entries = result.stdout.strip().splitlines()[:40]
-        lines.append(f"Files (top 40):\n" + "\n".join(entries))
-    except Exception:
-        try:
-            entries = [str(p) for p in Path(cwd).iterdir()][:20]
-            lines.append("Files:\n" + "\n".join(entries))
-        except Exception:
-            lines.append("Files: (unavailable)")
+        entries = []
+        cwd_path = Path(cwd)
+        for item in sorted(cwd_path.iterdir()):
+            if item.name in _excluded or item.name.startswith('.'):
+                continue
+            entries.append(str(item.relative_to(cwd_path)))
+            if item.is_dir():
+                try:
+                    for sub in sorted(item.iterdir())[:6]:
+                        if sub.name not in _excluded and not sub.name.startswith('.'):
+                            entries.append("  " + str(sub.relative_to(cwd_path)))
+                except PermissionError:
+                    pass
+            if len(entries) >= 40:
+                break
+        lines.append("Files:\n" + "\n".join(entries[:40]))
+    except Exception as e:
+        lines.append(f"Files: (unavailable: {e})")
 
-    # Git status (if in a repo)
+    # Git status (optional — may not be available on Windows without git)
     try:
         git = subprocess.run(
             ["git", "status", "--short", "--branch"],
             capture_output=True, text=True, timeout=3, cwd=cwd
         )
-        if git.returncode == 0:
+        if git.returncode == 0 and git.stdout.strip():
             lines.append(f"Git:\n{git.stdout.strip()[:200]}")
     except Exception:
-        pass
+        pass  # git not installed or not in a repo
+
+    # Windows-specific guidance injected into env context
+    if os_name == "Windows":
+        lines.append(
+            "SHELL: Windows cmd.exe. Use python -c '...' for complex file ops. "
+            "Use provided tools (find_files, grep, read_file) instead of Unix bash commands."
+        )
 
     ctx = "\n".join(lines)
     if len(ctx) > max_chars:
@@ -100,7 +119,7 @@ def build_env_context(max_chars: int = 800) -> str:
 # These models DON'T reliably produce JSON tool calls.
 # They DO reliably produce Thought/Bash/Done when shown an example.
 REACT_SYSTEM = """\
-You are a shell agent. Complete tasks by running bash commands.
+You are a shell agent. Complete tasks by running commands and using tools.
 
 ENVIRONMENT:
 {env_context}
@@ -118,6 +137,7 @@ RULES:
 - After Bash runs, you see the output — then decide next step
 - Write Done: only when you have the real answer from a command
 - NEVER repeat a Bash command you already ran — use the output you got
+- On Windows: prefer the find_files/grep/read_file tools over bash for file ops
 - Step {step}/{max_steps}
 """
 
@@ -398,7 +418,20 @@ class Agent:
 
                 # Build current_input: task + accumulated observations
                 if step == 1:
-                    current_input = f"Task: {task}"
+                    # PRE-BOOTSTRAP: find and read relevant files before first LLM call.
+                    # Claude Code always grounds in real file content before reasoning.
+                    bootstrap = self._quick_bootstrap(task)
+                    if bootstrap:
+                        current_input = (
+                            f"Task: {task}\n\n"
+                            f"I already read the relevant files. Here is the ACTUAL content:\n\n"
+                            f"{bootstrap}\n\n"
+                            f"Answer using ONLY the file content above. "
+                            f"Do NOT answer from training data. "
+                            f"If this fully answers the task, write Done: <answer>."
+                        )
+                    else:
+                        current_input = f"Task: {task}\nFirst: use find_files to locate relevant files."
                     if past_ctx:
                         current_input += f"\n\n{past_ctx}"
                 else:

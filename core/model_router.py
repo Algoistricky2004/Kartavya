@@ -184,6 +184,43 @@ _MODEL_REGISTRY: list[tuple[str, ModelSpec]] = [
         system_tokens=2048, tool_def_tokens=4096, memory_tokens=8192,
         task_ctx_tokens=2048, history_tokens=100000, input_tokens=8192, safety_buffer=4096,
     )),
+    # ── Additional Ollama community models ───────────────────────────────────
+    ("nemotron-mini", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=4096, supports_tools=False,
+        prompt_format="react", max_output=512, params_b=4.0,
+        system_tokens=200, tool_def_tokens=400, memory_tokens=200,
+        task_ctx_tokens=128, history_tokens=1024, input_tokens=512, safety_buffer=128,
+    )),
+    ("nemotron", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=4096, supports_tools=False,
+        prompt_format="react", max_output=512, params_b=4.0,
+        system_tokens=200, tool_def_tokens=400, memory_tokens=200,
+        task_ctx_tokens=128, history_tokens=1024, input_tokens=512, safety_buffer=128,
+    )),
+    ("deepseek-r1:1.5b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=4096, supports_tools=False,
+        prompt_format="react", max_output=512, params_b=1.5,
+        system_tokens=150, tool_def_tokens=300, memory_tokens=150,
+        task_ctx_tokens=64, history_tokens=768, input_tokens=384, safety_buffer=96,
+    )),
+    ("deepseek-r1:7b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=8192, supports_tools=False,
+        prompt_format="react", max_output=1024, params_b=7.0,
+        system_tokens=256, tool_def_tokens=512, memory_tokens=256,
+        task_ctx_tokens=128, history_tokens=2048, input_tokens=768, safety_buffer=192,
+    )),
+    ("phi4", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=16384, supports_tools=True,
+        prompt_format="xml", max_output=2048, params_b=14.0,
+        system_tokens=512, tool_def_tokens=1024, memory_tokens=512,
+        task_ctx_tokens=256, history_tokens=4096, input_tokens=1536, safety_buffer=256,
+    )),
+    ("codellama", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=16384, supports_tools=False,
+        prompt_format="react", max_output=2048, params_b=7.0,
+        system_tokens=256, tool_def_tokens=512, memory_tokens=256,
+        task_ctx_tokens=128, history_tokens=4096, input_tokens=1024, safety_buffer=256,
+    )),
 ]
 
 # Default spec for unknown models
