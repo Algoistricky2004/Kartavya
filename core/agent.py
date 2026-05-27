@@ -1,821 +1,841 @@
 """
-agent.py — Real harness engineering.
+tools.py — Tool registry with execution, permission checking, and result compression.
 
-How Claude Code / Aider / OpenCode actually work:
-  1. Bootstrap: inject cwd, ls, git status, OS info BEFORE first LLM call
-  2. ReAct loop: Thought → Action (bash cmd) → Observation → repeat
-  3. Bash is the primary tool — find, grep, git, cat, ls — all bash
-  4. Small models (llama3.2:3b): ReAct text format, NOT XML/JSON tool schemas
-  5. Auto-complete: if task is satisfied by accumulated outputs, stop
-  6. Hard loop kill: force complete with best result on critical repeat
-  7. Persistent run memory: save results, inject similar past runs on step 1
-
-ReAct prompt format (works reliably on 3b models):
-  Thought: I need to find python files
-  Bash: find . -name "*.py" | grep -v __pycache__
-
-  → Agent sees: Observation: core/agent.py\ncli/main.py\n...
-
-  Thought: I have all files now
-  Done: core/agent.py\ncli/main.py\ntools/tools.py
-
-IMPORTANT: task_done is NOT a model tool for small models.
-  The harness detects "Done:" in model output and auto-completes.
+Tools available:
+  bash          — Execute shell commands (with safety checks)
+  read_file     — Read file contents (with smart windowing)
+  write_file    — Write/overwrite file contents
+  append_file   — Append to file
+  list_dir      — List directory contents
+  grep          — Search file contents
+  find_files    — Find files by name/pattern
+  web_search    — Simple web search (DuckDuckGo)
+  memory_read   — Read from agent memory
+  memory_write  — Write to agent memory
+  task_done     — Signal task completion
+  ask_human     — Request human input
 """
 
-import os, re, sys, time, json, uuid, traceback, hashlib, platform, subprocess
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+import os
+import re
+import json
+import time
+import subprocess
+import fnmatch
+import platform
+from dataclasses import dataclass
+from typing import Optional
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Directories to always skip when searching files (avoids 700+ venv results)
+_EXCLUDED_DIRS = frozenset({
+    '__pycache__', '.git', '.hg', '.svn',
+    'node_modules', 'bower_components',
+    'venv', '.venv', 'env', 'virtualenv',
+    'site-packages', 'dist-packages',
+    'dist', 'build', 'target', '.eggs', '.tox',
+    '.pytest_cache', '.mypy_cache', '.ruff_cache',
+    '.idea', '.vscode',
+})
 
-from core.context_manager import ContextManager, BUDGET_PRESETS
-from core.memory import MemoryStore, MemorySection, MemoryPriority
-from observability.observability import ObservabilityManager, EventType
-from providers.providers import (get_provider, LLMProvider, LLMResponse,
-                                 parse_tool_calls, REACT_ONLY_MODELS)
-from tools.tools import ToolRegistry, ToolResult
+_IS_WINDOWS = platform.system() == "Windows"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Environment Bootstrap — injected at step 1
-# Real harnesses do this. Model needs to know WHERE it is.
-# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class ToolResult:
+    success: bool
+    output: str
+    error: Optional[str] = None
+    metadata: dict = None
 
-def build_env_context(max_chars: int = 800) -> str:
+    def __post_init__(self):
+        self.metadata = self.metadata or {}
+
+
+class ToolRegistry:
     """
-    Build shell environment snapshot: cwd, top-level files, git status, OS.
-    Uses pure Python (no Unix find command) so it works on Windows too.
+    Registry of available tools with:
+    - Permission enforcement
+    - Automatic result compression for context window
+    - Execution timeouts
+    - Safe defaults
     """
-    import platform
-    lines = []
 
-    # OS + Python version
-    os_name = platform.system()
-    lines.append(f"OS: {os_name} {platform.release()}")
-    lines.append(f"Python: {platform.python_version()}")
+    # Tools that need extra caution — ask before running
+    DANGEROUS_TOOLS  = {"bash", "write_file", "delete_file"}
 
-    # CWD
-    cwd = os.getcwd()
-    lines.append(f"CWD: {cwd}")
-
-    # Directory listing — pure Python, works on Windows and Unix
-    _excluded = {
-        '__pycache__', '.git', '.hg', '.svn', 'node_modules',
-        'venv', '.venv', 'env', 'virtualenv',
-        'site-packages', 'dist-packages', '.tox', 'dist', 'build',
-        '.pytest_cache', '.mypy_cache', '.eggs',
+    # Maximum output lengths (chars) per tool
+    MAX_OUTPUT = {
+        "bash":       2000,
+        "read_file":  3000,
+        "grep":       1500,
+        "list_dir":   1000,
+        "find_files": 800,
+        "web_search": 1500,
+        "memory_read":  800,
+        "str_replace":  500,
+        "create_file":  300,
+        "run_python":  2000,
     }
-    try:
-        entries = []
-        cwd_path = Path(cwd)
-        for item in sorted(cwd_path.iterdir()):
-            if item.name in _excluded or item.name.startswith('.'):
-                continue
-            entries.append(str(item.relative_to(cwd_path)))
-            if item.is_dir():
-                try:
-                    for sub in sorted(item.iterdir())[:6]:
-                        if sub.name not in _excluded and not sub.name.startswith('.'):
-                            entries.append("  " + str(sub.relative_to(cwd_path)))
-                except PermissionError:
-                    pass
-            if len(entries) >= 40:
-                break
-        lines.append("Files:\n" + "\n".join(entries[:40]))
-    except Exception as e:
-        lines.append(f"Files: (unavailable: {e})")
 
-    # Git status (optional — may not be available on Windows without git)
-    try:
-        git = subprocess.run(
-            ["git", "status", "--short", "--branch"],
-            capture_output=True, text=True, timeout=3, cwd=cwd
-        )
-        if git.returncode == 0 and git.stdout.strip():
-            lines.append(f"Git:\n{git.stdout.strip()[:200]}")
-    except Exception:
-        pass  # git not installed or not in a repo
-
-    # Windows-specific guidance injected into env context
-    if os_name == "Windows":
-        lines.append(
-            "SHELL: Windows cmd.exe. Use python -c '...' for complex file ops. "
-            "Use provided tools (find_files, grep, read_file) instead of Unix bash commands."
-        )
-
-    ctx = "\n".join(lines)
-    if len(ctx) > max_chars:
-        ctx = ctx[:max_chars] + "\n...(truncated)"
-    return ctx
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# System prompts — one per model family
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ReAct format for small local models (llama3.2:3b, gemma2:2b, phi3:mini etc.)
-# These models DON'T reliably produce JSON tool calls.
-# They DO reliably produce Thought/Bash/Done when shown an example.
-REACT_SYSTEM = """\
-You are a shell agent. Complete tasks by running commands and using tools.
-
-ENVIRONMENT:
-{env_context}
-
-FORMAT — use EXACTLY this, one action per reply:
-Thought: what you need to do
-Bash: <the shell command>
-
-When you have the final answer:
-Thought: I have the answer
-Done: <paste the actual command output here>
-
-RULES:
-- ONE Bash command per reply — nothing else
-- After Bash runs, you see the output — then decide next step
-- Write Done: only when you have the real answer from a command
-- NEVER repeat a Bash command you already ran — use the output you got
-- On Windows: prefer the find_files/grep/read_file tools over bash for file ops
-- Step {step}/{max_steps}
-"""
-
-# Full tool-calling system prompt for capable models (Claude, GPT-4, Groq)
-TOOL_SYSTEM = """\
-You are a coding agent. Complete tasks step-by-step using tools.
-
-ENVIRONMENT:
-{env_context}
-
-TOOL FORMAT (one tool per response, nothing else):
-<tool>tool_name</tool>
-<args>{{"key": "value"}}</args>
-
-AVAILABLE TOOLS: bash, read_file, write_file, find_files, list_dir, grep, task_done
-
-RULES:
-1. ONE tool per response
-2. After getting results — call task_done immediately with the actual output
-3. NEVER call the same tool twice with the same args — you already have the answer
-4. task_done output = real tool result, not a description
-5. Step {step}/{max_steps}
-"""
-
-def _pick_system(model: str, env_context: str, step: int, max_steps: int) -> str:
-    is_react = any(m in model.lower() for m in REACT_ONLY_MODELS) or \
-               any(s in model.lower() for s in ["3b", "1b", "2b", "7b", "8b"])
-    template = REACT_SYSTEM if is_react else TOOL_SYSTEM
-    return template.format(env_context=env_context, step=step, max_steps=max_steps)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Persistent Run Memory
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RunMemory:
-    def __init__(self, run_dir: str = ".agent_os/runs"):
-        self.run_dir = Path(run_dir)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.session_file = self.run_dir / "session_memory.jsonl"
-        self._cache: dict = {}
-        self._load()
-
-    def _load(self):
-        if self.session_file.exists():
-            for line in self.session_file.read_text().splitlines():
-                try:
-                    rec = json.loads(line)
-                    key = self._key(rec.get("task", ""))
-                    self._cache[key] = rec
-                except Exception:
-                    pass
-
-    def _key(self, task: str) -> str:
-        return hashlib.md5(task.strip().lower().encode()).hexdigest()[:12]
-
-    def save_result(self, task: str, output: str, success: bool,
-                    steps: int, tokens: int, cost: float, duration_ms: float):
-        rec = {
-            "task": task, "output": output[:2000], "success": success,
-            "steps": steps, "tokens": tokens, "cost": round(cost, 6),
-            "duration_ms": round(duration_ms, 1),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    def __init__(self, allowed: list[str] = None, require_approval: list[str] = None):
+        """
+        allowed: list of tool names to allow. None = all.
+        require_approval: list of tool names that need human approval.
+        """
+        self._allowed          = set(allowed) if allowed else None
+        self._require_approval = set(require_approval or [])
+        self._tool_handlers    = {
+            "bash":         self._bash,
+            "read_file":    self._read_file,
+            "write_file":   self._write_file,
+            "append_file":  self._append_file,
+            "list_dir":     self._list_dir,
+            "grep":         self._grep,
+            "find_files":   self._find_files,
+            "web_search":   self._web_search,
+            "memory_read":  self._memory_read,
+            "memory_write": self._memory_write,
+            "task_done":    self._task_done,
+            "ask_human":    self._ask_human,
+            "str_replace":  self._str_replace,
+            "create_file":  self._create_file,
+            "run_python":   self._run_python,
         }
-        self._cache[self._key(task)] = rec
-        with open(self.session_file, "a") as f:
-            f.write(json.dumps(rec) + "\n")
 
-    def get_similar(self, task: str, max_results: int = 2) -> list[dict]:
-        words = set(task.lower().split())
-        scored = []
-        for rec in self._cache.values():
-            prev = set(rec.get("task","").lower().split())
-            overlap = len(words & prev) / max(len(words), 1)
-            if overlap > 0.4:
-                scored.append((overlap, rec))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for _, r in scored[:max_results]]
-
-    def format_for_context(self, task: str) -> str:
-        similar = self.get_similar(task)
-        if not similar:
-            return ""
-        lines = ["[Similar past tasks:]"]
-        for r in similar[:2]:
-            icon = "✓" if r["success"] else "✗"
-            lines.append(f"{icon} Task: '{r['task'][:60]}'\n  Output: {r['output'][:150]}")
-        return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Task Intent Detector — knows when we already have the answer
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TaskIntentDetector:
-    COMPLETION_MAP = {
-        "list":   ["bash", "find_files", "list_dir"],
-        "find":   ["bash", "find_files", "grep"],
-        "search": ["bash", "grep", "web_search"],
-        "show":   ["bash", "read_file", "find_files", "list_dir"],
-        "read":   ["bash", "read_file"],
-        "count":  ["bash", "find_files"],
-        "check":  ["bash", "read_file", "grep"],
-        "run":    ["bash"],
-        "execute":["bash"],
-        "git":    ["bash"],
-    }
-
-    # A result that is ONLY a shell command — not real output
-    _CMD_RE = re.compile(
-        r'^(find|ls|grep|cat|echo|python|pip|git|bash|sh|cd|rm|mv|cp|curl)\b',
-        re.IGNORECASE)
-
-    @classmethod
-    def _is_real_output(cls, result: str) -> bool:
-        """True if result is real command output, not a bare command string."""
-        stripped = result.strip()
-        has_newline = "\n" in stripped
-        has_path    = "/" in stripped or ".py" in stripped or ".yaml" in stripped
-        if cls._CMD_RE.match(stripped) and not has_newline and len(stripped) < 120:
-            return False
-        return has_newline or has_path or len(stripped) > 100
-
-    @classmethod
-    def is_satisfied(cls, task: str, tool_results: dict) -> tuple[bool, str]:
-        task_lower = task.lower().strip()
-        for verb, tools in cls.COMPLETION_MAP.items():
-            if task_lower.startswith(verb) or f" {verb} " in f" {task_lower} ":
-                for tool in tools:
-                    if tool in tool_results:
-                        result = tool_results[tool]
-                        if len(result) > 30 and cls._is_real_output(result):
-                            return True, result
-        # Short task + any substantial real output
-        if len(task.split()) <= 8:
-            for tool, result in tool_results.items():
-                if tool not in ("task_done",) and len(result) > 30:
-                    if cls._is_real_output(result):
-                        return True, result
-        return False, ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Config & Result
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class AgentConfig:
-    agent_id:             str   = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:6]}")
-    model:                str   = "llama-3.1-8b-instant"
-    provider:             str   = "groq"
-    max_steps:            int   = 20
-    temperature:          float = 0.1      # lower = more deterministic commands
-    max_tokens_per_call:  int   = 512
-    memory_dir:           str   = ".agent_os/memory"
-    audit_dir:            str   = ".agent_os/audit"
-    run_dir:              str   = ".agent_os/runs"
-    allowed_tools:        list  = field(default_factory=list)
-    require_approval_for: list  = field(default_factory=lambda: ["bash_destructive"])
-    hallucination_threshold: float = 0.6
-    stream:               bool  = False    # False for reliable token counts on Ollama
-    token_budget_usd:     float = None     # None = unlimited; set e.g. 0.10 for $0.10 cap
-    role:                 str   = "general" # agent role: general | researcher | coder | tester | reviewer
-
-
-@dataclass
-class TaskResult:
-    task_id:             str
-    success:             bool
-    output:              str
-    steps_taken:         int
-    tokens_used:         int
-    cost_usd:            float
-    duration_ms:         float
-    trace_id:            str
-    errors:              list
-    hallucination_flags: list
-    loop_breaks:         int
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Agent:
-    def __init__(self, config: AgentConfig = None,
-                 api_key: str = None, ollama_host: str = None):
-        self.config  = config or AgentConfig()
-        self.obs     = ObservabilityManager(audit_dir=self.config.audit_dir)
-        self.ctx     = ContextManager(model=self.config.model)
-        self.memory  = MemoryStore(self.config.agent_id, self.config.memory_dir)
-        self.run_mem = RunMemory(self.config.run_dir)
-        self.tools   = ToolRegistry(
-            allowed=self.config.allowed_tools or None,
-            require_approval=self.config.require_approval_for,
-        )
-
-        env_key_map = {"groq":"GROQ_API_KEY","openai":"OPENAI_API_KEY",
-                       "anthropic":"ANTHROPIC_API_KEY","ollama":""}
-        resolved_key = api_key or os.environ.get(env_key_map.get(self.config.provider,""),"")
-        self.provider: LLMProvider = get_provider(
-            self.config.provider, api_key=resolved_key or None, host=ollama_host)
-
-        # Is this a tiny model that uses ReAct format?
-        self._is_react = (
-            self.config.model in REACT_ONLY_MODELS or
-            any(s in self.config.model.lower() for s in ["3b","1b","2b","7b","8b","mini"])
-        )
-
-        # Build env context once per session (cwd, files, git)
-        self._env_context = build_env_context()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Main entry point
-    # ─────────────────────────────────────────────────────────────────────
-
-    def run_task(self, task: str, task_id: str = None) -> TaskResult:
-        task_id    = task_id or uuid.uuid4().hex[:12]
-        trace_id   = self.obs.new_trace()
-        start_time = time.time()
-
-        past_ctx = self.run_mem.format_for_context(task)
-
-        self.memory.upsert(MemorySection.CURRENT_TASKS,
-                           f"[ACTIVE] {task_id}: {task[:100]}",
-                           priority=MemoryPriority.HIGH, tags=[task_id])
-
-        errors:              list  = []
-        hallucination_flags: list  = []
-        loop_breaks:         int   = 0
-        step_count:          int   = 0
-        total_tokens:        int   = 0
-        total_cost:          float = 0.0
-        final_output:        str   = ""
-        task_complete:       bool  = False
-        all_tool_results:    dict  = {}   # tool_name → output string
-
-        self.obs.bus.emit_simple(EventType.TASK_CREATED, trace_id=trace_id,
-                                 agent_id=self.config.agent_id, task_id=task_id,
-                                 metadata={"task": task[:200]})
-
-        print(f"\n{'='*60}")
-        print(f"🚀 TASK  {task_id}")
-        print(f"   Model:    {self.config.model}  via  {self.config.provider}")
-        print(f"   Mode:     {'ReAct/bash' if self._is_react else 'tool-calling'}")
-        print(f"   Task:     {task}")
-        if past_ctx:
-            print(f"   💾 Similar past run found")
-        print(f"{'='*60}")
-
-        task_span = self.obs.start_span("task", trace_id,
-                                        agent_id=self.config.agent_id, task_id=task_id)
-
-        for step in range(1, self.config.max_steps + 1):
-            step_count = step
-            step_span  = self.obs.start_span(f"step_{step}", trace_id, task_span.span_id,
-                                             self.config.agent_id, task_id)
-            print(f"\n── Step {step}/{self.config.max_steps} ──")
-
-            # ── PRE-STEP: satisfied already? ──────────────────────────────
-            if step > 1:
-                satisfied, sat_result = TaskIntentDetector.is_satisfied(task, all_tool_results)
-                if satisfied:
-                    if self._is_react:
-                        # Tiny models: auto-complete — don't trust model to say Done
-                        print(f"   ✅ Auto-complete: have answer from tools")
-                        final_output  = sat_result
-                        task_complete = True
-                        self.obs.end_span(step_span)
-                        break
-                    # Capable models: inject hint but let model call task_done
-                    # (they might want to do more steps)
-
-            try:
-                # ── 1. Build prompt ───────────────────────────────────────
-                system_prompt = _pick_system(
-                    self.config.model, self._env_context, step, self.config.max_steps)
-
-                # Build current_input: task + accumulated observations
-                if step == 1:
-                    # PRE-BOOTSTRAP: find and read relevant files before first LLM call.
-                    # Claude Code always grounds in real file content before reasoning.
-                    bootstrap = self._quick_bootstrap(task)
-                    if bootstrap:
-                        current_input = (
-                            f"Task: {task}\n\n"
-                            f"I already read the relevant files. Here is the ACTUAL content:\n\n"
-                            f"{bootstrap}\n\n"
-                            f"Answer using ONLY the file content above. "
-                            f"Do NOT answer from training data. "
-                            f"If this fully answers the task, write Done: <answer>."
-                        )
-                    else:
-                        current_input = f"Task: {task}\nFirst: use find_files to locate relevant files."
-                    if past_ctx:
-                        current_input += f"\n\n{past_ctx}"
-                else:
-                    # Show what the model already knows
-                    obs_lines = []
-                    for tool_name, result in list(all_tool_results.items())[-3:]:
-                        obs_lines.append(f"[{tool_name} output]:\n{result[:400]}")
-                    obs_block = "\n\n".join(obs_lines)
-                    current_input = (
-                        f"Task: {task}\n\n"
-                        f"Observations so far:\n{obs_block}\n\n"
-                        f"{'→ You have the answer — write Done: <output>' if self._is_react else '→ Call task_done if you have the answer, otherwise use next tool.'}"
-                    )
-
-                memory_chunks = self.memory.build_context_chunks(
-                    query=task, max_chunks=2, max_tokens=150)
-
-                # Tool definitions — only for capable models
-                step_tools = [] if self._is_react else \
-                             self.tools.get_definitions_for_step(step, task)
-
-                messages, ctx_snap = self.ctx.build(
-                    system_prompt=system_prompt,
-                    current_input=current_input,
-                    task_context=f"Step {step}/{self.config.max_steps}",
-                    memory_chunks=memory_chunks,
-                    tool_definitions=step_tools,
-                )
-
-                print(f"   📦 ctx:{ctx_snap.total_tokens}tk "
-                      f"headroom:{ctx_snap.headroom_tokens}tk "
-                      f"tools:{len(step_tools)} mem:{ctx_snap.memory_chunks_injected}")
-                for t in ctx_snap.truncations:
-                    print(f"   ✂  {t}")
-
-                # ── 2. LLM call ───────────────────────────────────────────
-                llm_start = time.time()
-                response: LLMResponse = self.provider.complete_with_retry(
-                    messages=messages,
-                    model=self.config.model,
-                    max_tokens=self.config.max_tokens_per_call,
-                    temperature=self.config.temperature,
-                    stream=self.config.stream,
-                    tools=step_tools or None,
-                )
-                llm_ms = (time.time() - llm_start) * 1000
-
-                cost = self.obs.record_llm_call(
-                    model=self.config.model,
-                    tokens_in=response.tokens_in,
-                    tokens_out=response.tokens_out,
-                    duration_ms=llm_ms,
-                    task_id=task_id,
-                    agent_id=self.config.agent_id,
-                )
-                total_tokens += response.tokens_in + response.tokens_out
-                total_cost   += cost
-
-                # ── Token budget enforcement ──────────────────────────────────
-                if self.config.token_budget_usd and total_cost >= self.config.token_budget_usd:
-                    budget_msg = (f"Token budget ${self.config.token_budget_usd:.4f} reached "
-                                  f"(spent ${total_cost:.4f}). Stopping.")
-                    print(f"   ⚠️  BUDGET CAP: {budget_msg}")
-                    errors.append(budget_msg)
-                    if all_tool_results:
-                        final_output  = max(all_tool_results.values(), key=len)
-                        task_complete = True
-                    self.obs.end_span(step_span, status="error", error=budget_msg)
-                    break
-
-                print(f"   🤖 {response.tokens_in}in/{response.tokens_out}out "
-                      f"| ${cost:.5f} | {llm_ms:.0f}ms")
-
-                # Show model's raw thought (first 200 chars)
-                preview = response.content[:200].replace('\n', ' ').strip()
-                if preview:
-                    print(f"   💬 {preview}")
-
-                # ── 3. Parse tool calls ───────────────────────────────────
-                tool_calls = response.tool_calls
-                if not tool_calls and response.content:
-                    tool_calls = parse_tool_calls(response.content)
-                    if tool_calls:
-                        print(f"   🔍 parsed from text: {tool_calls[0]['name']}")
-
-                # ── 4. If no tool call — check if model gave final answer ─
-                if not tool_calls:
-                    content = response.content.strip()
-                    print(f"   [NO TOOL PARSED]")
-
-                    # For ReAct models: extract Bash/Done from raw text manually
-                    if self._is_react:
-                        extracted = _extract_react(content)
-                        if extracted:
-                            tool_calls = [extracted]
-                            print(f"   🔍 manual extract: {extracted['name']}")
-
-                    # For all models: if content looks like a final answer, use it
-                    if not tool_calls and content:
-                        done_signals = [
-                            "here are", "found the following", "python files:",
-                            "the files are", "results:", "output:", "i found",
-                            ".py\n", ".py ",
-                        ]
-                        if any(s in content.lower() for s in done_signals):
-                            final_output  = content
-                            task_complete = True
-                            print(f"   ✅ Final answer detected in text")
-                            self.obs.end_span(step_span)
-                            break
-
-                    # No progress — inject hint and continue
-                    if not tool_calls:
-                        if self._is_react:
-                            hint = (
-                                f"[No command detected. Reply with EXACTLY:\n"
-                                f"Thought: I need to find python files\n"
-                                f"Bash: find . -name \"*.py\" -not -path \"*/__pycache__/*\"]"
-                            )
-                        else:
-                            hint = ("[No tool call detected. Use: "
-                                    "<tool>bash</tool>\\n<args>{\"command\":\"find . -name '*.py'\"}]</args>]")
-                        self.ctx.record_turn(current_input, hint)
-                        self.obs.end_span(step_span)
-                        continue
-
-                # ── 5. Execute tool calls ─────────────────────────────────
-                for tc in tool_calls:
-                    tool_name = tc["name"]
-                    tool_args = tc.get("args", {})
-
-                    if "_parse_error" in tool_args:
-                        self.ctx.record_turn(current_input,
-                            "[Parse error. Write the command more simply.]")
-                        continue
-
-                    print(f"   🔧 {tool_name}({json.dumps(tool_args)[:100]})")
-
-                    # ── task_done ─────────────────────────────────────────
-                    if tool_name == "task_done":
-                        raw = (tool_args.get("output") or
-                               tool_args.get("summary") or "Task completed.")
-                        # If the model passed a shell command as the answer instead of
-                        # the actual result, replace it with the best real tool output.
-                        _looks_like_cmd = bool(re.match(
-                            r'^(find|ls|grep|cat|echo|python|pip|git|cd|bash|sh)',
-                            raw.strip()))
-                        if all_tool_results and (_looks_like_cmd or len(raw.strip()) < 80):
-                            raw = max(all_tool_results.values(), key=len, default=raw)
-                        final_output  = raw
-                        task_complete = True
-                        print(f"   ✅ task_done")
-                        print(f"\n   📋 OUTPUT:\n{final_output[:600]}\n")
-                        self.memory.update_task_status(task_id, "DONE", raw[:80])
-                        self.obs.end_span(step_span)
-                        break
-
-                    # ── Loop detection ────────────────────────────────────
-                    loop_r = self.obs.check_loop(tool_name, tool_args)
-                    if loop_r.stuck:
-                        loop_breaks += 1
-                        print(f"   🔄 LOOP [{loop_r.level}] count={loop_r.count}")
-                        if loop_r.level == "critical":
-                            if all_tool_results:
-                                final_output  = max(all_tool_results.values(), key=len)
-                                task_complete = True
-                                print(f"   ⛔ Hard kill → force complete")
-                                self.obs.end_span(step_span)
-                                break
-                            else:
-                                self.ctx.record_turn(current_input,
-                                    f"[BLOCKED: {tool_name} called {loop_r.count}x same args. "
-                                    f"Try a completely different command.]")
-                                break
-                        else:
-                            self.ctx.record_turn(current_input,
-                                f"[WARNING: {tool_name} repeated. "
-                                f"Use the output you already have, or run a different command.]")
-                            break
-
-                    # ── Approval ──────────────────────────────────────────
-                    if self._requires_approval(tool_name, tool_args):
-                        if not self._request_approval(tool_name, tool_args, task_id):
-                            self.ctx.record_turn(current_input,
-                                f"[DENIED: {tool_name}. Try another approach.]")
-                            continue
-
-                    # ── Execute ───────────────────────────────────────────
-                    tool_span = self.obs.start_span(
-                        f"tool.{tool_name}", trace_id, step_span.span_id,
-                        self.config.agent_id, task_id)
-
-                    tool_result: ToolResult = self.tools.execute(tool_name, tool_args)
-                    self.obs.record_tool(tool_name, tool_args, tool_result.output)
-                    self.obs.end_span(tool_span,
-                                      status="ok" if tool_result.success else "error",
-                                      error=tool_result.error or "")
-
-                    if tool_result.success and tool_result.output:
-                        # Key by tool_name + step so repeated bash calls don't overwrite
-                        result_key = tool_name if tool_name != "bash" else f"bash_{step}"
-                        all_tool_results[result_key] = tool_result.output
-                        # Also keep the canonical key updated (for intent detector compat)
-                        all_tool_results[tool_name] = tool_result.output
-                        self.obs.hallucination.update_verified_fact(
-                            f"{tool_name}_last", tool_result.output[:200],
-                            source=f"tool:{tool_name}")
-
-                    icon = "✓" if tool_result.success else "✗"
-                    print(f"   {icon} {tool_result.output[:200].replace(chr(10),' ')}")
-                    if tool_result.error:
-                        print(f"     ERR: {tool_result.error[:100]}")
-
-                    # ── Feed observation back — this is the harness loop ──
-                    # Model sees: what it ran + what happened
-                    if self._is_react:
-                        # ReAct format: Observation block
-                        if tool_result.success:
-                            observation = (
-                                f"Observation:\n{tool_result.output[:600]}\n\n"
-                                f"Now decide: is the task done? If yes write Done: <output>. "
-                                f"If not, write your next Thought: and Bash: command."
-                            )
-                        else:
-                            observation = (
-                                f"Observation: ERROR — {tool_result.error or 'command failed'}\n"
-                                f"Try a different command."
-                            )
-                    else:
-                        # Tool format: structured result
-                        if tool_result.success:
-                            observation = (
-                                f"[{tool_name} result]:\n{tool_result.output[:500]}\n\n"
-                                f"Tools used so far: {list(all_tool_results.keys())}\n"
-                                f"→ If this answers '{task[:60]}', call task_done with this output."
-                            )
-                        else:
-                            observation = (
-                                f"[{tool_name} FAILED]: {tool_result.error}\n"
-                                f"→ Try a different approach."
-                            )
-
-                    self.ctx.record_turn(f"[ran {tool_name}]", observation)
-
-                    # ── Immediate satisfaction check for tiny models ───────
-                    if self._is_react and tool_result.success:
-                        sat, sat_result = TaskIntentDetector.is_satisfied(
-                            task, all_tool_results)
-                        if sat:
-                            # Don't wait for model — complete now
-                            print(f"   ✅ Auto-complete: task satisfied by bash output")
-                            final_output  = sat_result
-                            task_complete = True
-                            self.obs.end_span(step_span)
-                            break
-
-            except KeyboardInterrupt:
-                errors.append("interrupted by user")
-                self.obs.end_span(step_span, status="error", error="interrupted")
-                break
-            except Exception as e:
-                err = f"step {step} — {type(e).__name__}: {e}"
-                errors.append(err)
-                print(f"   ❌ {err}")
-                print(f"      {traceback.format_exc().splitlines()[-1]}")
-                self.obs.end_span(step_span, status="error", error=err)
-                self.memory.upsert(MemorySection.ERRORS_SEEN, err[:120],
-                                   priority=MemoryPriority.HIGH, ttl_hours=1)
-                # Fast-fail on fatal errors — no point retrying all 20 steps
-                fatal_signals = [
-                    "Failed to connect", "Connection refused", "ollama serve",
-                    "api_key", "401", "403", "ImportError", "ModuleNotFoundError",
-                ]
-                if any(sig.lower() in str(e).lower() for sig in fatal_signals):
-                    print(f"   🛑 Fatal error — stopping immediately (not retrying 20 steps)")
-                    break
-                continue
-
-            self.obs.end_span(step_span)
-
-            if task_complete:
-                break
-
-        # ── Wrap up ───────────────────────────────────────────────────────
-        duration_ms = (time.time() - start_time) * 1000
-        success     = task_complete and bool(final_output) and not errors
-
-        self.obs.end_span(task_span, status="ok" if success else "error")
-        self.obs.bus.emit_simple(
-            EventType.TASK_COMPLETED if success else EventType.TASK_FAILED,
-            trace_id=trace_id, agent_id=self.config.agent_id, task_id=task_id,
-            success=success, duration_ms=duration_ms,
-            metadata={"steps": step_count, "tokens": total_tokens, "cost": total_cost})
-
-        if not task_complete:
-            self.memory.update_task_status(task_id, "INCOMPLETE",
-                                           f"hit max_steps={self.config.max_steps}")
-
-        self.run_mem.save_result(
-            task=task, output=final_output, success=success,
-            steps=step_count, tokens=total_tokens,
-            cost=total_cost, duration_ms=duration_ms)
-
-        result = TaskResult(
-            task_id=task_id, success=success, output=final_output,
-            steps_taken=step_count, tokens_used=total_tokens,
-            cost_usd=total_cost, duration_ms=duration_ms,
-            trace_id=trace_id, errors=errors,
-            hallucination_flags=hallucination_flags, loop_breaks=loop_breaks,
-        )
-
-        print(f"\n{'='*60}")
-        icon = "✅ DONE" if success else ("⚠️  INCOMPLETE" if not errors else "❌ FAILED")
-        print(f"{icon} | {step_count} steps | {total_tokens:,}tk | "
-              f"${total_cost:.5f} | {duration_ms:.0f}ms")
-        if errors:
-            print(f"Errors: {'; '.join(errors[:2])}")
-        print(f"{'='*60}\n")
-
-        return result
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _requires_approval(self, tool: str, args: dict) -> bool:
-        if tool in self.config.require_approval_for:
+    def is_allowed(self, tool_name: str) -> bool:
+        if self._allowed is None:
             return True
-        args_s = json.dumps(args).lower()
-        return any(d in args_s for d in ["rm -rf /", "format c:", "drop table",
-                                          "truncate", "--force --all"])
+        return tool_name in self._allowed
 
-    def _request_approval(self, tool: str, args: dict, task_id: str) -> bool:
-        if hasattr(self, "_approval_cb") and self._approval_cb:
-            return self._approval_cb(tool, args)
-        print(f"\n   ⚠️  APPROVAL REQUIRED: {tool}({json.dumps(args)[:100]})")
+    def all_tool_names(self) -> list[str]:
+        return list(self._tool_handlers.keys())
+
+    def requires_approval(self, tool_name: str) -> bool:
+        return tool_name in self._require_approval
+
+    def execute(self, tool_name: str, args: dict) -> ToolResult:
+        """Execute a tool and return compressed result."""
+        if not self.is_allowed(tool_name):
+            return ToolResult(success=False, output="",
+                              error=f"Tool '{tool_name}' is not allowed for this agent")
+
+        handler = self._tool_handlers.get(tool_name)
+        if not handler:
+            return ToolResult(success=False, output="",
+                              error=f"Unknown tool: {tool_name}. Available: {list(self._tool_handlers.keys())}")
+
         try:
-            return input("   Approve? (y/n): ").strip().lower() in ("y","yes")
+            result = handler(args)
+            # Compress output to fit context window
+            max_len = self.MAX_OUTPUT.get(tool_name, 1000)
+            if len(result.output) > max_len:
+                truncated = result.output[:max_len]
+                result.output = truncated + f"\n... [output truncated at {max_len} chars]"
+            return result
+        except Exception as e:
+            return ToolResult(success=False, output="", error=f"{type(e).__name__}: {e}")
+
+    def get_definitions_for_step(self, step: int, task: str) -> list[dict]:
+        """
+        Return only the tools likely needed for this step.
+        This is the KEY optimization for small context windows:
+        never inject all 12 tools when you only need 2-3.
+        """
+        task_lower = task.lower()
+        step_tools = set()
+
+        # Always include: task_done (to signal completion)
+        step_tools.add("task_done")
+
+        # File reading tools (almost always needed)
+        step_tools.update(["read_file", "grep", "find_files", "list_dir"])
+
+        # Writing tools (only if task involves writing)
+        write_keywords = ["fix", "write", "create", "update", "modify", "edit",
+                          "add", "implement", "change", "refactor", "correct"]
+        if any(kw in task_lower for kw in write_keywords):
+            step_tools.update(["write_file", "append_file"])
+
+        # Bash (only if task involves running commands)
+        bash_keywords = ["run", "execute", "test", "install", "build", "compile",
+                         "start", "deploy", "check", "verify", "debug"]
+        if any(kw in task_lower for kw in bash_keywords):
+            step_tools.add("bash")
+
+        # Web search (only if research needed)
+        search_keywords = ["search", "find", "look up", "research", "web", "internet"]
+        if any(kw in task_lower for kw in search_keywords):
+            step_tools.add("web_search")
+
+        # Memory tools (always available but rarely needed in context)
+        if step <= 2:  # Only on early steps when context is being established
+            step_tools.add("memory_read")
+
+        # Human help (only on later steps when stuck)
+        if step > self._calculate_max_steps(task) * 0.7:
+            step_tools.add("ask_human")
+
+        # Filter by allowed
+        if self._allowed:
+            step_tools = step_tools & self._allowed
+
+        return [self._get_definition(t) for t in step_tools
+                if t in self._tool_handlers]
+
+    def _calculate_max_steps(self, task: str) -> int:
+        """Estimate task complexity from description."""
+        words = len(task.split())
+        if words < 10: return 5
+        if words < 30: return 10
+        return 20
+
+    def _get_definition(self, tool_name: str) -> dict:
+        """Terse tool definition (saves tokens vs full JSON schema)."""
+        definitions = {
+            "bash": {
+                "name": "bash",
+                "description": "Run shell command. Use for: tests, builds, file operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)"},
+                        "cwd": {"type": "string", "description": "Working directory"},
+                    },
+                    "required": ["command"],
+                },
+            },
+            "read_file": {
+                "name": "read_file",
+                "description": "Read file contents. Supports line range for large files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer", "description": "Start line (optional)"},
+                        "end_line":   {"type": "integer", "description": "End line (optional)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+            "write_file": {
+                "name": "write_file",
+                "description": "Write content to file (creates or overwrites).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            "append_file": {
+                "name": "append_file",
+                "description": "Append content to end of file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                },
+            },
+            "list_dir": {
+                "name": "list_dir",
+                "description": "List directory contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "recursive": {"type": "boolean"},
+                    },
+                    "required": ["path"],
+                },
+            },
+            "grep": {
+                "name": "grep",
+                "description": "Search for pattern in files. Returns matching lines with line numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path":    {"type": "string"},
+                        "case_sensitive": {"type": "boolean", "default": False},
+                    },
+                    "required": ["pattern", "path"],
+                },
+            },
+            "find_files": {
+                "name": "find_files",
+                "description": "Find files matching a name pattern.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "e.g. '*.py', 'test_*.py'"},
+                        "directory": {"type": "string", "default": "."},
+                        "max_results": {"type": "integer", "default": 20},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+            "web_search": {
+                "name": "web_search",
+                "description": "Search the web via DuckDuckGo.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+            "memory_read": {
+                "name": "memory_read",
+                "description": "Read from agent memory. Returns relevant stored facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+            "memory_write": {
+                "name": "memory_write",
+                "description": "Store a fact to memory for later retrieval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content":  {"type": "string"},
+                        "section":  {"type": "string", "enum": ["project_facts","decisions","errors_seen"]},
+                        "priority": {"type": "string", "enum": ["high","normal","low"]},
+                    },
+                    "required": ["content", "section"],
+                },
+            },
+            "str_replace": {
+                "name": "str_replace",
+                "description": "Targeted file patch. Find EXACT text and replace it. Safer than write_file for bug fixes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "File path to patch"},
+                        "old_str": {"type": "string", "description": "Exact text to find (match indentation exactly)"},
+                        "new_str": {"type": "string", "description": "Replacement text"},
+                    },
+                    "required": ["path", "old_str", "new_str"],
+                },
+            },
+            "run_python": {
+                "name": "run_python",
+                "description": "Run a Python file. Auto-uses pytest for test files. Shows PASSED/FAILED.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "Python file to run"},
+                        "timeout": {"type": "integer", "description": "Timeout seconds (default 30)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+            "create_file": {
+                "name": "create_file",
+                "description": "Create a new file with given content. Fails if file already exists.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "New file path"},
+                        "content": {"type": "string", "description": "File content"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            "task_done": {
+                "name": "task_done",
+                "description": "Signal that the task is complete. Include final answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string", "description": "What was accomplished"},
+                        "output":  {"type": "string", "description": "Final output/answer"},
+                    },
+                    "required": ["summary"],
+                },
+            },
+            "ask_human": {
+                "name": "ask_human",
+                "description": "Ask the human user a question when stuck.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}},
+                    "required": ["question"],
+                },
+            },
+        }
+        return definitions.get(tool_name, {"name": tool_name, "description": "", "parameters": {}})
+    def get_definition(self, allowed=None) -> list[dict]:
+        """
+        Return tool schemas formatted for LLM tool/function calling.
+        """
+
+        tool_names = list(self._tool_handlers.keys())
+
+        # Filter allowed tools
+        if allowed:
+            tool_names = [
+                name for name in tool_names
+                if name in allowed
+            ]
+
+        defs = []
+
+        for name in tool_names:
+            tool_def = self._get_definition(name)
+
+            if tool_def:
+                defs.append({
+                    "type": "function",
+                    "function": tool_def,
+                })
+
+        return defs
+
+    # ── Tool implementations ───────────────────────────────────────────────
+
+    @staticmethod
+    def _win_translate(command: str) -> str:
+        """Translate common Unix commands to Windows equivalents."""
+        if not _IS_WINDOWS:
+            return command
+        cmd = command.strip()
+        # python3 -> python (most important on Windows)
+        cmd = re.sub(r'\bpython3\b', 'python', cmd)
+        # ls -> dir
+        if re.match(r'^ls(-la?|-al?)?\s*$', cmd):
+            return 'dir'
+        # pwd -> cd
+        if cmd == 'pwd':
+            return 'cd'
+        # cat file -> type file
+        m = re.match(r'^cat\s+(.+)', cmd)
+        if m:
+            return f'type {m.group(1)}'
+        # which cmd -> where cmd
+        m = re.match(r'^which\s+(\S+)', cmd)
+        if m:
+            return f'where {m.group(1)}'
+        return cmd
+
+    def _bash(self, args: dict) -> ToolResult:
+        command = args.get("command", "")
+        if not command:
+            return ToolResult(success=False, output="", error="No command provided")
+
+        timeout = int(args.get("timeout", 30))
+        cwd     = args.get("cwd", os.getcwd())
+
+        # Translate common Unix commands to Windows equivalents
+        command = self._win_translate(command)
+
+        # Safety: block most destructive commands
+        dangerous = ["rm -rf /", "format", "mkfs", ":(){:|:&};:"]
+        for d in dangerous:
+            if d in command:
+                return ToolResult(success=False, output="",
+                                  error=f"Blocked dangerous command: {d}")
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if not output:
+                output = f"[Command completed with exit code {result.returncode}]"
+            return ToolResult(
+                success=result.returncode == 0,
+                output=output,
+                error=result.stderr if result.returncode != 0 else None,
+                metadata={"exit_code": result.returncode, "command": command},
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(success=False, output="",
+                              error=f"Command timed out after {timeout}s: {command}")
+
+    def _read_file(self, args: dict) -> ToolResult:
+        path = args.get("path", "")
+        if not path:
+            return ToolResult(success=False, output="", error="No path provided")
+
+        try:
+            p = Path(path)
+            if not p.exists():
+                return ToolResult(success=False, output="",
+                                  error=f"File not found: {path}")
+            if not p.is_file():
+                return ToolResult(success=False, output="",
+                                  error=f"Not a file: {path}")
+
+            content = p.read_text(errors="replace")
+            lines   = content.split("\n")
+            total   = len(lines)
+
+            start = args.get("start_line")
+            end   = args.get("end_line")
+
+            if start is not None or end is not None:
+                s = max(0, int(start or 1) - 1)
+                e = min(total, int(end or total))
+                selected = lines[s:e]
+                numbered = "\n".join(f"{s+i+1}: {l}" for i, l in enumerate(selected))
+                header   = f"[{path} — lines {s+1}-{e} of {total}]\n"
+                return ToolResult(success=True, output=header + numbered,
+                                  metadata={"path": path, "total_lines": total})
+
+            # Return all with line numbers (will be truncated by registry)
+            numbered = "\n".join(f"{i+1}: {l}" for i, l in enumerate(lines))
+            return ToolResult(success=True, output=f"[{path} — {total} lines]\n" + numbered,
+                              metadata={"path": path, "total_lines": total})
+
+        except PermissionError:
+            return ToolResult(success=False, output="", error=f"Permission denied: {path}")
+
+    def _write_file(self, args: dict) -> ToolResult:
+        path    = args.get("path", "")
+        content = args.get("content", "")
+        if not path:
+            return ToolResult(success=False, output="", error="No path")
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            lines = len(content.split("\n"))
+            return ToolResult(success=True,
+                              output=f"Written {lines} lines to {path} ({len(content)} bytes)")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _append_file(self, args: dict) -> ToolResult:
+        path    = args.get("path", "")
+        content = args.get("content", "")
+        try:
+            with open(path, "a") as f:
+                f.write(content)
+            return ToolResult(success=True, output=f"Appended {len(content)} chars to {path}")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _list_dir(self, args: dict) -> ToolResult:
+        path      = args.get("path", ".")
+        recursive = args.get("recursive", False)
+        try:
+            p = Path(path)
+            if not p.exists():
+                return ToolResult(success=False, output="", error=f"Path not found: {path}")
+
+            if recursive:
+                entries = []
+                for item in sorted(p.rglob("*"))[:100]:
+                    rel = item.relative_to(p)
+                    entries.append(f"{'[D]' if item.is_dir() else '[F]'} {rel}")
+                return ToolResult(success=True, output="\n".join(entries))
+            else:
+                entries = []
+                for item in sorted(p.iterdir()):
+                    icon = "📁" if item.is_dir() else "📄"
+                    size = f"({item.stat().st_size}b)" if item.is_file() else ""
+                    entries.append(f"{icon} {item.name} {size}")
+                return ToolResult(success=True, output=f"[{path}]\n" + "\n".join(entries))
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _grep(self, args: dict) -> ToolResult:
+        pattern = args.get("pattern", "")
+        path    = args.get("path", ".")
+        case    = args.get("case_sensitive", False)
+        if not pattern:
+            return ToolResult(success=False, output="", error="No pattern")
+
+        flags = 0 if case else re.IGNORECASE
+        matches = []
+
+        try:
+            p = Path(path)
+            files = [p] if p.is_file() else list(p.rglob("*"))
+            for f in files:
+                if not f.is_file():
+                    continue
+                try:
+                    text = f.read_text(errors="replace")
+                    for i, line in enumerate(text.split("\n"), 1):
+                        if re.search(pattern, line, flags):
+                            rel = f.relative_to(Path(path)) if p.is_dir() else f
+                            matches.append(f"{rel}:{i}: {line.strip()[:100]}")
+                            if len(matches) >= 50:
+                                break
+                except (PermissionError, UnicodeDecodeError):
+                    pass
+                if len(matches) >= 50:
+                    break
+
+            if not matches:
+                return ToolResult(success=True,
+                                  output=f"No matches for '{pattern}' in {path}")
+            return ToolResult(success=True,
+                              output=f"{len(matches)} match(es) for '{pattern}':\n" + "\n".join(matches))
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _find_files(self, args: dict) -> ToolResult:
+        pattern     = args.get("pattern", "*")
+        directory   = args.get("directory", ".")
+        max_results = int(args.get("max_results", 20))
+        try:
+            p = Path(directory).resolve()
+            matches = []
+            for item in p.rglob("*"):
+                if not item.is_file():
+                    continue
+                try:
+                    rel = item.relative_to(p)
+                except ValueError:
+                    continue
+                # Skip non-project dirs: venv, __pycache__, .git, node_modules…
+                if any(part in _EXCLUDED_DIRS for part in rel.parts[:-1]):
+                    continue
+                if fnmatch.fnmatch(item.name, pattern):
+                    matches.append(str(rel))
+                    if len(matches) >= max_results:
+                        break
+            if not matches:
+                return ToolResult(success=True,
+                                  output=f"No files matching '{pattern}' in {directory}")
+            return ToolResult(
+                success=True,
+                output=f"{len(matches)} file(s) matching '{pattern}':\n"
+                       + "\n".join(sorted(matches)),
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _web_search(self, args: dict) -> ToolResult:
+        query = args.get("query", "")
+        if not query:
+            return ToolResult(success=False, output="", error="No query")
+        try:
+            import urllib.request, urllib.parse
+            q = urllib.parse.quote(query)
+            url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
+            req = urllib.request.Request(url, headers={"User-Agent": "AgentOS/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            results = []
+            if data.get("AbstractText"):
+                results.append(f"Summary: {data['AbstractText'][:300]}")
+            for topic in data.get("RelatedTopics", [])[:5]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append(f"• {topic['Text'][:150]}")
+            if not results:
+                return ToolResult(success=True, output=f"No results for: {query}")
+            return ToolResult(success=True, output="\n".join(results))
+        except Exception as e:
+            return ToolResult(success=False, output="", error=f"Search failed: {e}")
+
+    def _memory_read(self, args: dict) -> ToolResult:
+        query = args.get("query", "")
+        # Import lazily to avoid circular imports
+        return ToolResult(success=True,
+                          output=f"[memory_read: use memory.build_context_chunks('{query}')]")
+
+    def _memory_write(self, args: dict) -> ToolResult:
+        content  = args.get("content", "")
+        section  = args.get("section", "project_facts")
+        priority = args.get("priority", "normal")
+        return ToolResult(success=True,
+                          output=f"[memory_write: stored '{content[:50]}' to {section}]",
+                          metadata={"section": section, "priority": priority, "content": content})
+
+    def _task_done(self, args: dict) -> ToolResult:
+        summary = args.get("summary", "Task completed")
+        output  = args.get("output", "")
+        return ToolResult(success=True,
+                          output=f"TASK_DONE: {summary}" + (f"\n{output}" if output else ""),
+                          metadata={"done": True, "summary": summary})
+
+    # ── str_replace — targeted file patching (Claude Code style) ────────────
+    def _str_replace(self, args: dict) -> ToolResult:
+        """
+        Apply a targeted find-and-replace to a file.
+        Safer than write_file: only touches the exact lines you specify.
+        
+        Usage: str_replace(path="file.py", old_str="broken code", new_str="fixed code")
+        
+        Rules:
+        - old_str must match EXACTLY (including indentation and whitespace)
+        - old_str must appear exactly ONCE in the file
+        - Fails with a helpful error if not found or ambiguous
+        """
+        path    = args.get("path", "")
+        old_str = args.get("old_str", "")
+        new_str = args.get("new_str", "")
+
+        if not path:
+            return ToolResult(success=False, output="", error="path is required")
+        if old_str is None:
+            return ToolResult(success=False, output="", error="old_str is required")
+
+        try:
+            p = Path(path)
+            if not p.exists():
+                return ToolResult(success=False, output="",
+                                  error=f"File not found: {path}")
+
+            original = p.read_text(encoding="utf-8", errors="replace")
+            count = original.count(old_str)
+
+            if count == 0:
+                # Give a helpful hint: show nearby content
+                hint_lines = []
+                for i, line in enumerate(original.splitlines(), 1):
+                    stripped_old = old_str.strip().splitlines()[0][:40] if old_str.strip() else ""
+                    if stripped_old and stripped_old in line:
+                        hint_lines.append(f"  Line {i}: {repr(line)}")
+                hint = ("\nHint — similar lines found:\n" + "\n".join(hint_lines[:3])) if hint_lines else ""
+                return ToolResult(success=False, output="",
+                                  error=f"old_str not found in {path}. "
+                                        f"Check exact spacing/indentation.{hint}")
+
+            if count > 1:
+                # Show context of each match so the model can disambiguate
+                ctx_lines = []
+                file_lines = original.splitlines()
+                pos = 0
+                match_num = 0
+                temp = original
+                while old_str in temp and match_num < count:
+                    match_num += 1
+                    idx2 = temp.find(old_str)
+                    # Count line number of this match
+                    chars_before = len(original) - len(temp) + idx2
+                    line_num = original[:chars_before].count("\n") + 1
+                    # Show 2 lines before + match + 2 lines after
+                    start = max(0, line_num - 3)
+                    end   = min(len(file_lines), line_num + len(old_str.splitlines()) + 1)
+                    block = "\n".join(f"  {start+i+1}: {file_lines[start+i]}"
+                                      for i in range(end - start))
+                    ctx_lines.append(f"Match {match_num} (line {line_num}):\n{block}")
+                    temp = temp[idx2 + len(old_str):]
+
+                ctx = "\n\n".join(ctx_lines)
+                tip = (f"\n\nFix: include the function def line in old_str to disambiguate. "
+                       f"Example:\n"
+                       f'"old_str": "def subtract(a, b):\\n    return a + b"'
+)
+                return ToolResult(success=False, output="",
+                                  error=(f"old_str matches {count} locations in {path}. "
+                                         f"Add surrounding lines to pick the right one.\n\n"
+                                         f"{ctx}{tip}"))
+
+            # ── Indentation fix ──────────────────────────────────────────
+            # Models often write new_str without leading spaces because they
+            # write old_str without them too. Detect the base indent of the
+            # matched line and apply it to every subsequent line of new_str.
+            # Without this: "if b==0:\n    return None" inside a 4-space
+            # function body produces wrong indentation → SyntaxError.
+            match_pos    = original.find(old_str)
+            line_start   = original.rfind("\n", 0, match_pos) + 1
+            base_indent  = original[line_start:match_pos]   # whitespace before old_str
+            adjusted_new = new_str
+            if base_indent and base_indent.strip() == "" and "\n" in new_str:
+                lines = new_str.split("\n")
+                adjusted_new = lines[0]
+                for ln in lines[1:]:
+                    # Add base indent to every non-empty continuation line
+                    adjusted_new += "\n" + (base_indent + ln if ln.strip() else ln)
+
+            patched = original.replace(old_str, adjusted_new, 1)
+            p.write_text(patched, encoding="utf-8")
+
+            # Show a diff-like summary
+            old_lines = old_str.splitlines()
+            new_lines = new_str.splitlines()
+            diff_preview = ""
+            for l in old_lines[:4]:
+                diff_preview += f"  - {l}\n"
+            for l in new_lines[:4]:
+                diff_preview += f"  + {l}\n"
+
+            return ToolResult(
+                success=True,
+                output=f"str_replace applied to {path}\n{diff_preview.strip()}",
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _create_file(self, args: dict) -> ToolResult:
+        """Create a new file. Fails if file already exists (use write_file to overwrite)."""
+        path    = args.get("path", "")
+        content = args.get("content", "")
+        if not path:
+            return ToolResult(success=False, output="", error="path required")
+        try:
+            p = Path(path)
+            if p.exists():
+                return ToolResult(success=False, output="",
+                                  error=f"{path} already exists. Use write_file to overwrite.")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            return ToolResult(success=True,
+                              output=f"Created {path} ({len(content.splitlines())} lines)")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _run_python(self, args: dict) -> ToolResult:
+        """
+        Run a Python file or module. Auto-detects test files and uses pytest.
+        Sets PYTHONIOENCODING=utf-8 so Windows cmd doesn't choke on Unicode output.
+        """
+        path    = args.get("path", "")
+        timeout = int(args.get("timeout", 30))
+        extra   = args.get("args", "")
+
+        if not path:
+            return ToolResult(success=False, output="", error="path required")
+
+        is_test = "test" in Path(path).name.lower() or "spec" in Path(path).name.lower()
+        if is_test:
+            cmd = f"python -m pytest {path} -v --tb=short 2>&1"
+        else:
+            cmd = f"python {path} {extra}".strip()
+
+        # PYTHONIOENCODING=utf-8 prevents UnicodeEncodeError on Windows cmd
+        # when the script prints non-ASCII chars (checkmarks, arrows, etc.)
+        import os as _os
+        env_cmd = cmd
+        if _IS_WINDOWS:
+            env_cmd = f"set PYTHONIOENCODING=utf-8 && {cmd}"
+        else:
+            env_cmd = f"PYTHONIOENCODING=utf-8 {cmd}"
+
+        result = self._bash({"command": env_cmd, "timeout": timeout})
+        out = result.output or ""
+        passed = result.success and all(
+            x not in out.lower()
+            for x in ("traceback", "error:", "assertionerror", "syntaxerror",
+                       "nameerror", "typeerror", "failed")
+        )
+        banner = "[PASSED]" if passed else "[FAILED]"
+        return ToolResult(
+            success=result.success,
+            output=f"{banner}\n{out}",
+            error=result.error,
+        )
+
+    def _ask_human(self, args: dict) -> ToolResult:
+        question = args.get("question", "")
+        print(f"\n❓ Agent asks: {question}")
+        try:
+            answer = input("Your answer: ").strip()
+            return ToolResult(success=True, output=f"Human says: {answer}")
         except (EOFError, KeyboardInterrupt):
-            return False
-
-    def get_trace(self, trace_id: str) -> str:
-        return self.obs.tracer.format_trace(trace_id)
-
-    def dashboard(self):
-        self.obs.print_dashboard()
-
-    def memory_export(self) -> str:
-        return self.memory.export_markdown()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ReAct extractor — last-resort manual parse for llama3.2:3b
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _extract_react(content: str) -> Optional[dict]:
-    """
-    Manually extract Bash or Done from model text when the regex parser misses it.
-    Handles llama3.2:3b's inconsistent output formatting.
-    """
-    lines = content.strip().splitlines()
-
-    # Scan line by line for patterns
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-
-        # Bash command
-        if re.match(r'^(Bash|Action|Command)\s*:', stripped, re.IGNORECASE):
-            cmd = re.sub(r'^(Bash|Action|Command)\s*:\s*', '', stripped, flags=re.IGNORECASE).strip()
-            cmd = cmd.strip('`').strip()
-            # Check next line for multi-line command (code block)
-            if not cmd and i + 1 < len(lines):
-                cmd = lines[i+1].strip().strip('`')
-            if cmd:
-                return {"name": "bash", "args": {"command": cmd}}
-
-        # Done / Final answer
-        if re.match(r'^(Done|Answer|Final|Result)\s*:', stripped, re.IGNORECASE):
-            answer = re.sub(r'^(Done|Answer|Final|Result)\s*:\s*', '', stripped,
-                            flags=re.IGNORECASE).strip()
-            # Collect remaining lines as part of answer
-            if i + 1 < len(lines):
-                answer = answer + "\n" + "\n".join(lines[i+1:])
-            answer = answer.strip()
-            if answer:
-                return {"name": "task_done",
-                        "args": {"summary": answer[:100], "output": answer}}
-
-    return None
+            return ToolResult(success=False, output="", error="No human input available")

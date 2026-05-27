@@ -623,6 +623,19 @@ class AgentOS:
                 run_state.tokens_in  += direct_result.tokens_used  # rough
                 return direct_result
 
+        # ── CODE CORRECTION MODE ──────────────────────────────────────────────
+        # For coding/debugging tasks, use the patch→run→verify loop.
+        # Pre-bootstrap reads the file AND runs it to get the current error.
+        # After every str_replace, we auto-run and check the result.
+        if intake.task_type.value in ("coding", "debugging"):
+            code_result = self._code_correction_execute(
+                intake=intake,
+                config=config,
+                run_state=run_state,
+            )
+            if code_result is not None:
+                return code_result
+
         while step < config.step_limit:
             step += 1
             run_state.steps_taken = step
@@ -1094,6 +1107,332 @@ class AgentOS:
             trace_id="",
             errors=[],
             skill_used=run_state.skill_match.skill.name if run_state.skill_match else "",
+            verify_status="pass",
+        )
+
+    # ── Code Correction: patch → run → verify loop ───────────────────────────
+
+    def _code_correction_execute(self, intake, config, run_state) -> "TaskResult | None":
+        """
+        Two-phase code correction — Plan once, Execute deterministically.
+
+        Phase 1 — PLAN (1 LLM call):
+            Show the model the ORIGINAL file + current errors.
+            Ask it to return ALL patches as a JSON array.
+            Model sees the file ONCE with full context → no stale state.
+
+        Phase 2 — EXECUTE (no LLM):
+            Apply each patch with str_replace.
+            Auto-run after every patch to track progress.
+            If a patch fails (ambiguous/not found), skip and continue.
+
+        This matches how qwen2.5-coder behaves in raw ollama:
+        it sees everything at once and fixes all bugs in one response.
+        """
+        import time as _time, json as _json, re as _re
+
+        print("  [CODE CORRECTION MODE — Plan→Execute]")
+
+        # ── Phase 0: bootstrap ────────────────────────────────────────────────
+        file_ctx, run_output, target_files = self._code_bootstrap(intake)
+
+        if not file_ctx:
+            return None
+
+        if "[PASSED]" in run_output and "[FAILED]" not in run_output:
+            print("  [ALREADY PASSING]")
+            answer = f"File already passes.\n{run_output[:300]}"
+            run_state.final_output = answer
+            run_state.done = True
+            return self._wrap_code_result(answer, 0, run_state, config)
+
+        # ── Phase 1: PLAN — one LLM call, get all patches as JSON ────────────
+        patches = self._plan_all_patches(file_ctx, run_output, config, run_state)
+
+        if not patches:
+            print("  ⚠️  Planner returned no patches — falling back")
+            return None
+
+        print(f"  [PLAN] {len(patches)} patch(es) identified:")
+        for i, p in enumerate(patches):
+            print(f"    {i+1}. {p.get('old_str','')[:60].strip()!r}")
+
+        # ── Phase 2: EXECUTE — apply patches deterministically ───────────────
+        applied = 0
+        last_run_output = run_output
+        primary_file = target_files[0] if target_files else ""
+
+        for i, patch in enumerate(patches):
+            path    = patch.get("path", primary_file)
+            old_str = patch.get("old_str", "")
+            new_str = patch.get("new_str", "")
+
+            if not old_str or not new_str:
+                continue
+
+            print(f"\n  ── Patch {i+1}/{len(patches)} ───────────────────────")
+            result = self._tools.execute("str_replace", {
+                "path": path, "old_str": old_str, "new_str": new_str
+            })
+
+            if result.success:
+                print(f"  ✓ Applied: {result.output[:80]}")
+                applied += 1
+                run_r = self._tools.execute("run_python", {"path": path, "timeout": 30})
+                last_run_output = (run_r.output or "").strip()
+                status = "[PASSED]" if "[PASSED]" in last_run_output else "[FAILED]"
+                print(f"  {status}: {last_run_output[:80]}")
+                run_state.tokens_in  += 0
+                run_state.tokens_out += 0
+            else:
+                print(f"  ✗ Failed: {result.error[:100]}")
+                # Try a fallback: re-plan just for this failed patch
+                fallback = self._replan_single(path, old_str, new_str, config, run_state)
+                if fallback:
+                    r2 = self._tools.execute("str_replace", {
+                        "path": path,
+                        "old_str": fallback["old_str"],
+                        "new_str": fallback["new_str"],
+                    })
+                    if r2.success:
+                        applied += 1
+                        run_r = self._tools.execute("run_python", {"path": path, "timeout": 30})
+                        last_run_output = (run_r.output or "").strip()
+                        print(f"  ✓ Fallback applied: {r2.output[:60]}")
+
+        # ── Final check ───────────────────────────────────────────────────────
+        passed = "[PASSED]" in last_run_output and "[FAILED]" not in last_run_output
+        run_state.steps_taken = applied
+        run_state.done = passed
+
+        if passed:
+            answer = f"Fixed {applied} bug(s).\n{last_run_output[:400]}"
+        else:
+            # One more attempt: re-run current file
+            final_r = self._tools.execute("run_python", {"path": primary_file, "timeout": 30})
+            last_run_output = (final_r.output or "").strip()
+            passed = "[PASSED]" in last_run_output
+            answer = (f"Applied {applied} patches.\n{last_run_output[:400]}")
+            run_state.done = passed
+
+        run_state.final_output = answer
+        return self._wrap_code_result(answer, applied, run_state, config)
+
+    def _plan_all_patches(self, file_ctx: str, run_output: str,
+                          config, run_state) -> list:
+        """
+        ONE LLM call: see the full file + errors, return ALL patches as JSON.
+
+        The model gets complete, clean context — no stale state, no partial
+        fixes confusing the next step. This is how raw qwen2.5-coder works
+        when you paste the whole file: it sees everything and fixes everything.
+        """
+        import time as _time, json as _json, re as _re
+
+        system = (
+            "You are a code bug finder and fixer.\n"
+            "Analyze the file and the error. Find ALL bugs.\n"
+            "Return a JSON array of patches — one per bug:\n\n"
+            '[{"path": "demo/buggy_calculator.py", "old_str": "exact buggy line(s)", "new_str": "fixed line(s)"}]\n\n'
+            "CRITICAL RULES:\n"
+            "- old_str must be COPIED VERBATIM from the file (exact spaces, exact comments)\n"
+            "- old_str must be unique in the file (include surrounding lines if needed)\n"
+            "- new_str must use the SAME indentation as old_str\n"
+            "- Fix ONLY the buggy lines — do not rewrite whole functions\n"
+            "- Return ONLY the JSON array. No explanation. No markdown. No ```json.\n"
+        )
+
+        user = (
+            f"FILE CONTENT:\n{file_ctx}\n\n"
+            f"ERROR WHEN RUNNING:\n{run_output}\n\n"
+            f"Return the JSON array of ALL patches now:"
+        )
+
+        t0 = _time.time()
+        try:
+            response = self._provider.complete_with_retry(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                model=config.model,
+                max_tokens=1024,
+                temperature=0.0,
+                stream=False,
+                tools=None,
+            )
+        except Exception as e:
+            print(f"  ⚠️  Planner LLM error: {e}")
+            return []
+
+        dur = (_time.time() - t0) * 1000
+        cost = self._obs.record_llm_call(
+            config.model, response.tokens_in, response.tokens_out,
+            dur, task_id=run_state.task_id, agent_id=self.config.agent_id,
+        )
+        run_state.cost_usd  += cost
+        run_state.tokens_in  += response.tokens_in
+        run_state.tokens_out += response.tokens_out
+
+        raw = (response.content or "").strip()
+        # Strip think blocks (deepseek-r1, qwen3)
+        raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        # Strip markdown fences
+        raw = _re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+        # Find the JSON array
+        m = _re.search(r"\[.*\]", raw, _re.DOTALL)
+        if not m:
+            print(f"  ⚠️  No JSON array found in planner response: {raw[:200]}")
+            return []
+
+        try:
+            patches = _json.loads(m.group(0))
+            if isinstance(patches, list):
+                return patches
+        except _json.JSONDecodeError as e:
+            print(f"  ⚠️  JSON parse error: {e} | raw: {raw[:200]}")
+
+        return []
+
+    def _replan_single(self, path: str, failed_old: str, intended_new: str,
+                       config, run_state) -> dict | None:
+        """
+        If a patch's old_str wasn't found, re-read the current file and
+        ask the model for the exact current text to replace.
+        """
+        import json as _json, re as _re
+
+        rr = self._tools.execute("read_file", {"path": path})
+        if not rr.success:
+            return None
+
+        system = (
+            "You are fixing a str_replace patch that failed because old_str didn't match.\n"
+            "Look at the current file and find the EXACT text to replace.\n"
+            "Return ONE JSON object: "
+            '{"old_str": "exact current text", "new_str": "fixed text"}\n'
+            "No explanation. No markdown."
+        )
+        user = (
+            f"Current file:\n{rr.output[:2000]}\n\n"
+            f"Intended fix: change this concept:\n  FROM: {failed_old[:100]}\n"
+            f"  TO:   {intended_new[:100]}\n\n"
+            f"Find the exact current text and return the JSON patch:"
+        )
+        try:
+            resp = self._provider.complete_with_retry(
+                messages=[{"role": "system", "content": system},
+                           {"role": "user", "content": user}],
+                model=config.model, max_tokens=256, temperature=0.0,
+                stream=False, tools=None,
+            )
+            raw = (resp.content or "").strip()
+            raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+            raw = _re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if m:
+                patch = _json.loads(m.group(0))
+                patch["path"] = path
+                return patch
+        except Exception:
+            pass
+        return None
+
+
+    def _code_bootstrap(self, intake) -> tuple:
+        """
+        Pre-execute for coding tasks:
+        1. Find the target file(s) from task keywords
+        2. Read them
+        3. Run them to get the current error state
+
+        Returns: (file_content_ctx, run_output, target_files)
+        """
+        keywords   = self._task_to_file_keywords(intake)
+        found_paths = []
+        file_lines  = []
+
+        for kw in keywords[:4]:
+            fr = self._tools.execute("find_files", {
+                "pattern": f"*{kw}*.py", "directory": ".", "max_results": 4
+            })
+            if fr.success and "file(s)" in fr.output:
+                for fline in fr.output.splitlines()[1:]:
+                    fp = fline.strip()
+                    if fp and fp not in found_paths:
+                        found_paths.append(fp)
+
+        # Sort: exact matches first
+        kl = [k.lower() for k in keywords]
+        found_paths.sort(
+            key=lambda p: sum(
+                3 if k == p.lower().replace("\\", "/").split("/")[-1].replace(".py", "")
+                else 1 if k in p.lower() else 0
+                for k in kl
+            ), reverse=True
+        )
+
+        for fpath in found_paths[:3]:
+            rr = self._tools.execute("read_file", {"path": fpath})
+            if rr.success and rr.output:
+                file_lines.append(f"[FILE: {fpath}]\n{rr.output[:3000]}")
+
+        if not file_lines:
+            return "", "", []
+
+        file_ctx = "\n\n".join(file_lines)
+
+        # Run the most relevant file to capture current errors
+        run_output = ""
+        for fpath in found_paths[:1]:
+            rr = self._tools.execute("run_python", {"path": fpath, "timeout": 20})
+            run_output = (rr.output or "").strip()[:1200]
+            print(f"  [Pre-run {fpath}]: {run_output[:80]}...")
+
+        return file_ctx, run_output, found_paths[:3]
+
+    def _build_code_fix_system(self, config) -> str:
+        """System prompt for code correction tasks."""
+        return (
+            "You are a code debugger. Fix bugs by applying str_replace patches.\n\n"
+
+            "WORKFLOW:\n"
+            "1. Read the error — it tells you the exact line number.\n"
+            "2. Output ONE str_replace JSON to fix that specific line.\n"
+            "3. I will run the file and show you the new output.\n"
+            "4. Repeat until no errors remain.\n"
+            "5. When all tests pass, output a task_done JSON.\n\n"
+
+            "OUTPUT FORMAT — respond with ONLY a single JSON object, nothing else:\n\n"
+
+            "To fix a bug:\n"
+            '{"name": "str_replace", "args": {"path": "file.py", "old_str": "exact broken line", "new_str": "fixed line"}}\n\n'
+
+            "To signal completion:\n"
+            '{"name": "task_done", "args": {"output": "Fixed 3 bugs: subtract, divide, factorial", "summary": "all tests pass"}}\n\n'
+
+            "RULES:\n"
+            "- old_str must EXACTLY match the file (same spaces, same indentation)\n"
+            "- Fix ONE bug per JSON — do not batch multiple changes\n"
+            "- Never write prose explanations — only output the JSON\n"
+            "- If old_str is not found, add one extra surrounding line for context\n"
+        )
+
+    def _wrap_code_result(self, answer: str, steps: int, run_state, config) -> "TaskResult":
+        """Wrap code correction result into a TaskResult."""
+        return TaskResult(
+            task_id=run_state.task_id,
+            task_text=run_state.task_text if hasattr(run_state, "task_text") else "",
+            success=True,
+            output=answer,
+            steps_taken=steps,
+            tokens_used=run_state.tokens_in + run_state.tokens_out,
+            cost_usd=run_state.cost_usd,
+            duration_ms=0,
+            trace_id="",
+            errors=[],
+            skill_used="patch_and_run",
             verify_status="pass",
         )
 

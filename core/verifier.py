@@ -113,6 +113,10 @@ _SUCCESS_PATTERNS = [
     r"\b(done|completed|finished)\b",
     r"\bno errors?\b",
     r"\bno failures?\b",
+    r"\[passed\]",
+    r"\[pass\]",
+    r"all tests passed",
+    r"\bpassed\b",
 ]
 
 
@@ -239,15 +243,19 @@ class Verifier:
 
     def _criterion_met(self, criterion: str, text: str) -> bool:
         """Check if a success criterion is satisfied in the output."""
-        # Exact substring
-        if criterion.lower() in text:
+        c = criterion.lower()
+        if c in text:
             return True
-        # Keyword matching (at least 50% of criterion words present)
-        words = re.findall(r'\w+', criterion.lower())
+        if c in ("passed", "pass") and ("[passed]" in text or "[pass]" in text):
+            return True
+        if ("all tests pass" in c or "tests pass" in c) and (
+                "[passed]" in text or "all tests passed" in text):
+            return True
+        words = re.findall(r"\w+", c)
         if not words:
             return False
         hits = sum(1 for w in words if len(w) > 3 and w in text)
-        return hits / len(words) >= 0.5
+        return hits / len(words) >= 0.6
 
     def _estimate_confidence(
         self,

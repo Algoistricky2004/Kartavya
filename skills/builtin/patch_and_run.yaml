@@ -1,0 +1,100 @@
+---
+# skills/builtin/patch_and_run.yaml
+#
+# The Claude Code-style code correction skill:
+#   Read file → Understand error → Apply str_replace patch → Run → Verify → Iterate
+#
+# Key insight: the harness auto-runs the code after every str_replace.
+# The model never needs to call bash to verify — we handle the run-verify loop.
+
+name: patch_and_run
+version: 1.0.0
+description: |
+  Fix a bug or error in code: read the file, identify the exact issue,
+  apply a targeted str_replace patch, run it, verify it passes.
+  Iterates until the code runs cleanly.
+  Use when: fixing bugs, syntax errors, failing tests, broken code.
+
+tags:
+  - fix
+  - bug
+  - patch
+  - debug
+  - error
+  - broken
+  - failing
+  - correct
+  - repair
+  - crash
+  - syntax error
+  - not working
+  - TypeError
+  - AttributeError
+  - ImportError
+  - NameError
+
+task_types: [coding, debugging]
+complexity: [simple, moderate, complex]
+
+steps:
+  - id: read_and_diagnose
+    description: Read the target file and run it to capture the current error
+    tools: [find_files, read_file, run_python, bash, grep]
+    prompt_hint: |
+      1. Find the file with find_files if you don't have the path.
+      2. Read the full file with read_file.
+      3. Run it with run_python to see the current error message.
+      Don't fix anything yet — just understand what's broken.
+    max_tool_calls: 4
+
+  - id: apply_patch
+    description: Apply the minimal targeted fix using str_replace
+    tools: [str_replace, read_file]
+    prompt_hint: |
+      Use str_replace to fix the EXACT broken lines.
+      Rules for str_replace:
+        - old_str must match character-for-character (spaces, indentation)
+        - Change only the broken lines — don't rewrite the whole function
+        - If the fix is complex, apply one str_replace at a time
+      Never use write_file to rewrite the whole file.
+    max_tool_calls: 3
+
+  - id: run_and_verify
+    description: Run the patched code and check if it passes
+    tools: [run_python, bash]
+    prompt_hint: |
+      Run the file with run_python. Check the output:
+        ✅ PASSED → you're done, signal task_done
+        ❌ FAILED → read the new error carefully, go back to apply_patch
+      The harness will auto-run after each str_replace, so you may
+      not need an explicit run_python call.
+    max_tool_calls: 2
+
+  - id: iterate_if_failing
+    description: If still failing, diagnose the new error and apply another patch
+    tools: [str_replace, read_file, grep, run_python]
+    prompt_hint: |
+      New error after your patch? Good — you fixed the first bug.
+      Now fix the next one:
+        1. Read the new error message carefully
+        2. Use read_file to see the current state of the file
+        3. Apply another str_replace for the next bug
+        4. Run again with run_python
+      Repeat until PASSED.
+    max_tool_calls: 6
+
+success_criteria:
+  - "code runs without error"
+  - "tests pass"
+  - "PASSED"
+  - "no error"
+  - "successfully"
+
+failure_criteria:
+  - "Traceback"
+  - "Error:"
+  - "FAILED"
+  - "assert"
+
+token_estimate: 12000
+max_steps: 12

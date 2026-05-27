@@ -221,6 +221,45 @@ _MODEL_REGISTRY: list[tuple[str, ModelSpec]] = [
         system_tokens=256, tool_def_tokens=512, memory_tokens=256,
         task_ctx_tokens=128, history_tokens=4096, input_tokens=1024, safety_buffer=256,
     )),
+
+    # ── Qwen family ───────────────────────────────────────────────────────────
+    # qwen2.5-coder:7b — best SLM for code tasks, 32K context, native tool call
+    ("qwen2.5-coder:7b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=32768, supports_tools=True,
+        prompt_format="xml", max_output=4096, params_b=7.0,
+        system_tokens=512, tool_def_tokens=1024, memory_tokens=512,
+        task_ctx_tokens=256, history_tokens=8192, input_tokens=2048, safety_buffer=512,
+    )),
+    ("qwen2.5-coder:1.5b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=8192, supports_tools=False,
+        prompt_format="react", max_output=1024, params_b=1.5,
+        system_tokens=200, tool_def_tokens=400, memory_tokens=200,
+        task_ctx_tokens=128, history_tokens=2048, input_tokens=512, safety_buffer=128,
+    )),
+    ("qwen2.5-coder:14b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=32768, supports_tools=True,
+        prompt_format="xml", max_output=4096, params_b=14.0,
+        system_tokens=512, tool_def_tokens=1024, memory_tokens=512,
+        task_ctx_tokens=256, history_tokens=8192, input_tokens=2048, safety_buffer=512,
+    )),
+    ("qwen2.5-coder:32b", ModelSpec(
+        tier=ModelTier.LLM, context_tokens=32768, supports_tools=True,
+        prompt_format="xml", max_output=4096, params_b=32.0,
+        system_tokens=1024, tool_def_tokens=2048, memory_tokens=1024,
+        task_ctx_tokens=512, history_tokens=16384, input_tokens=4096, safety_buffer=1024,
+    )),
+    ("qwen2.5:7b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=32768, supports_tools=True,
+        prompt_format="xml", max_output=2048, params_b=7.0,
+        system_tokens=512, tool_def_tokens=1024, memory_tokens=512,
+        task_ctx_tokens=256, history_tokens=8192, input_tokens=2048, safety_buffer=512,
+    )),
+    ("qwen3:8b", ModelSpec(
+        tier=ModelTier.SLM, context_tokens=32768, supports_tools=True,
+        prompt_format="xml", max_output=4096, params_b=8.0,
+        system_tokens=512, tool_def_tokens=1024, memory_tokens=512,
+        task_ctx_tokens=256, history_tokens=8192, input_tokens=2048, safety_buffer=512,
+    )),
 ]
 
 # Default spec for unknown models

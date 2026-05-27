@@ -72,7 +72,10 @@ class ToolRegistry:
         "list_dir":   1000,
         "find_files": 800,
         "web_search": 1500,
-        "memory_read": 800,
+        "memory_read":  800,
+        "str_replace":  500,
+        "create_file":  300,
+        "run_python":  2000,
     }
 
     def __init__(self, allowed: list[str] = None, require_approval: list[str] = None):
@@ -95,6 +98,9 @@ class ToolRegistry:
             "memory_write": self._memory_write,
             "task_done":    self._task_done,
             "ask_human":    self._ask_human,
+            "str_replace":  self._str_replace,
+            "create_file":  self._create_file,
+            "run_python":   self._run_python,
         }
 
     def is_allowed(self, tool_name: str) -> bool:
@@ -301,6 +307,43 @@ class ToolRegistry:
                         "priority": {"type": "string", "enum": ["high","normal","low"]},
                     },
                     "required": ["content", "section"],
+                },
+            },
+            "str_replace": {
+                "name": "str_replace",
+                "description": "Targeted file patch. Find EXACT text and replace it. Safer than write_file for bug fixes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "File path to patch"},
+                        "old_str": {"type": "string", "description": "Exact text to find (match indentation exactly)"},
+                        "new_str": {"type": "string", "description": "Replacement text"},
+                    },
+                    "required": ["path", "old_str", "new_str"],
+                },
+            },
+            "run_python": {
+                "name": "run_python",
+                "description": "Run a Python file. Auto-uses pytest for test files. Shows PASSED/FAILED.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "Python file to run"},
+                        "timeout": {"type": "integer", "description": "Timeout seconds (default 30)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+            "create_file": {
+                "name": "create_file",
+                "description": "Create a new file with given content. Fails if file already exists.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "New file path"},
+                        "content": {"type": "string", "description": "File content"},
+                    },
+                    "required": ["path", "content"],
                 },
             },
             "task_done": {
@@ -618,6 +661,175 @@ class ToolRegistry:
         return ToolResult(success=True,
                           output=f"TASK_DONE: {summary}" + (f"\n{output}" if output else ""),
                           metadata={"done": True, "summary": summary})
+
+    # ── str_replace — targeted file patching (Claude Code style) ────────────
+    def _str_replace(self, args: dict) -> ToolResult:
+        """
+        Apply a targeted find-and-replace to a file.
+        Safer than write_file: only touches the exact lines you specify.
+        
+        Usage: str_replace(path="file.py", old_str="broken code", new_str="fixed code")
+        
+        Rules:
+        - old_str must match EXACTLY (including indentation and whitespace)
+        - old_str must appear exactly ONCE in the file
+        - Fails with a helpful error if not found or ambiguous
+        """
+        path    = args.get("path", "")
+        old_str = args.get("old_str", "")
+        new_str = args.get("new_str", "")
+
+        if not path:
+            return ToolResult(success=False, output="", error="path is required")
+        if old_str is None:
+            return ToolResult(success=False, output="", error="old_str is required")
+
+        try:
+            p = Path(path)
+            if not p.exists():
+                return ToolResult(success=False, output="",
+                                  error=f"File not found: {path}")
+
+            original = p.read_text(encoding="utf-8", errors="replace")
+            count = original.count(old_str)
+
+            if count == 0:
+                # Give a helpful hint: show nearby content
+                hint_lines = []
+                for i, line in enumerate(original.splitlines(), 1):
+                    stripped_old = old_str.strip().splitlines()[0][:40] if old_str.strip() else ""
+                    if stripped_old and stripped_old in line:
+                        hint_lines.append(f"  Line {i}: {repr(line)}")
+                hint = ("\nHint — similar lines found:\n" + "\n".join(hint_lines[:3])) if hint_lines else ""
+                return ToolResult(success=False, output="",
+                                  error=f"old_str not found in {path}. "
+                                        f"Check exact spacing/indentation.{hint}")
+
+            if count > 1:
+                # Show context of each match so the model can disambiguate
+                ctx_lines = []
+                file_lines = original.splitlines()
+                pos = 0
+                match_num = 0
+                temp = original
+                while old_str in temp and match_num < count:
+                    match_num += 1
+                    idx2 = temp.find(old_str)
+                    # Count line number of this match
+                    chars_before = len(original) - len(temp) + idx2
+                    line_num = original[:chars_before].count("\n") + 1
+                    # Show 2 lines before + match + 2 lines after
+                    start = max(0, line_num - 3)
+                    end   = min(len(file_lines), line_num + len(old_str.splitlines()) + 1)
+                    block = "\n".join(f"  {start+i+1}: {file_lines[start+i]}"
+                                      for i in range(end - start))
+                    ctx_lines.append(f"Match {match_num} (line {line_num}):\n{block}")
+                    temp = temp[idx2 + len(old_str):]
+
+                ctx = "\n\n".join(ctx_lines)
+                tip = (f"\n\nFix: include the function def line in old_str to disambiguate. "
+                       f"Example:\n"
+                       f'"old_str": "def subtract(a, b):\\n    return a + b"'
+)
+                return ToolResult(success=False, output="",
+                                  error=(f"old_str matches {count} locations in {path}. "
+                                         f"Add surrounding lines to pick the right one.\n\n"
+                                         f"{ctx}{tip}"))
+
+            # ── Indentation fix ──────────────────────────────────────────
+            # Models often write new_str without leading spaces because they
+            # write old_str without them too. Detect the base indent of the
+            # matched line and apply it to every subsequent line of new_str.
+            # Without this: "if b==0:\n    return None" inside a 4-space
+            # function body produces wrong indentation → SyntaxError.
+            match_pos    = original.find(old_str)
+            line_start   = original.rfind("\n", 0, match_pos) + 1
+            base_indent  = original[line_start:match_pos]   # whitespace before old_str
+            adjusted_new = new_str
+            if base_indent and base_indent.strip() == "" and "\n" in new_str:
+                lines = new_str.split("\n")
+                adjusted_new = lines[0]
+                for ln in lines[1:]:
+                    # Add base indent to every non-empty continuation line
+                    adjusted_new += "\n" + (base_indent + ln if ln.strip() else ln)
+
+            patched = original.replace(old_str, adjusted_new, 1)
+            p.write_text(patched, encoding="utf-8")
+
+            # Show a diff-like summary
+            old_lines = old_str.splitlines()
+            new_lines = new_str.splitlines()
+            diff_preview = ""
+            for l in old_lines[:4]:
+                diff_preview += f"  - {l}\n"
+            for l in new_lines[:4]:
+                diff_preview += f"  + {l}\n"
+
+            return ToolResult(
+                success=True,
+                output=f"str_replace applied to {path}\n{diff_preview.strip()}",
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _create_file(self, args: dict) -> ToolResult:
+        """Create a new file. Fails if file already exists (use write_file to overwrite)."""
+        path    = args.get("path", "")
+        content = args.get("content", "")
+        if not path:
+            return ToolResult(success=False, output="", error="path required")
+        try:
+            p = Path(path)
+            if p.exists():
+                return ToolResult(success=False, output="",
+                                  error=f"{path} already exists. Use write_file to overwrite.")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            return ToolResult(success=True,
+                              output=f"Created {path} ({len(content.splitlines())} lines)")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _run_python(self, args: dict) -> ToolResult:
+        """
+        Run a Python file or module. Auto-detects test files and uses pytest.
+        Sets PYTHONIOENCODING=utf-8 so Windows cmd doesn't choke on Unicode output.
+        """
+        path    = args.get("path", "")
+        timeout = int(args.get("timeout", 30))
+        extra   = args.get("args", "")
+
+        if not path:
+            return ToolResult(success=False, output="", error="path required")
+
+        is_test = "test" in Path(path).name.lower() or "spec" in Path(path).name.lower()
+        if is_test:
+            cmd = f"python -m pytest {path} -v --tb=short 2>&1"
+        else:
+            cmd = f"python {path} {extra}".strip()
+
+        # PYTHONIOENCODING=utf-8 prevents UnicodeEncodeError on Windows cmd
+        # when the script prints non-ASCII chars (checkmarks, arrows, etc.)
+        import os as _os
+        env_cmd = cmd
+        if _IS_WINDOWS:
+            env_cmd = f"set PYTHONIOENCODING=utf-8 && {cmd}"
+        else:
+            env_cmd = f"PYTHONIOENCODING=utf-8 {cmd}"
+
+        result = self._bash({"command": env_cmd, "timeout": timeout})
+        out = result.output or ""
+        passed = result.success and all(
+            x not in out.lower()
+            for x in ("traceback", "error:", "assertionerror", "syntaxerror",
+                       "nameerror", "typeerror", "failed")
+        )
+        banner = "[PASSED]" if passed else "[FAILED]"
+        return ToolResult(
+            success=result.success,
+            output=f"{banner}\n{out}",
+            error=result.error,
+        )
 
     def _ask_human(self, args: dict) -> ToolResult:
         question = args.get("question", "")

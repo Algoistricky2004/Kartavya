@@ -71,35 +71,73 @@ def parse_tool_calls(content: str) -> list[dict]:
     """
     Parse tool calls from model text output.
 
-    Priority: Done/Answer > Bash block > Bash inline > XML > JSON
-
-    Critical fix for llama3.2:3b: it writes "Bash:\n  Done: answer" or
-    "Bash:\n  Done:" (empty). Both must resolve to task_done, not bash.
+    Handles:
+    - deepseek-r1 / qwen reasoning models: strips <think>...</think> blocks first
+    - JSON in ```json code blocks
+    - Flat JSON objects: {"name": "str_replace", "args": {...}}
+    - ReAct Done: signal (checked BEFORE Bash:)
+    - Bash: inline/block
+    - XML <tool>
     """
     c = content.strip()
 
-    # ── PRIORITY 1: Done/Answer signal — always checked first ────────────────
+    # ── Step 0: strip reasoning/thinking blocks (deepseek-r1, qwen, etc.) ────
+    c = re.sub(r'<think>.*?</think>', '', c, flags=re.DOTALL).strip()
+    c = re.sub(r'<thinking>.*?</thinking>', '', c, flags=re.DOTALL).strip()
+    c = re.sub(r'<reasoning>.*?</reasoning>', '', c, flags=re.DOTALL).strip()
+
+    # ── Step 1: extract from ```json code blocks (deepseek-r1 prefers this) ──
+    json_block = re.search(r'```(?:json)?\s*\n(\{.*?\})\s*\n```', c, re.DOTALL)
+    if json_block:
+        parsed = _safe_json(json_block.group(1))
+        if parsed:
+            name = parsed.get('name') or parsed.get('tool') or parsed.get('function')
+            args = parsed.get('args') or parsed.get('arguments') or parsed.get('parameters') or {}
+            if name:
+                return [{'name': name, 'args': args}]
+            # Maybe it's a direct str_replace format: {"path": ..., "old_str": ..., "new_str": ...}
+            if 'path' in parsed and 'old_str' in parsed:
+                return [{'name': 'str_replace', 'args': parsed}]
+
+    # ── Step 2: Done/Answer signal — BEFORE any Bash check ───────────────────
     done_m = re.search(
         r'(?:^|\n)\s*(?:Done|Answer|Final|Result)\s*:\s*(.*)',
         c, re.IGNORECASE | re.DOTALL
     )
     if done_m:
         answer = done_m.group(1).strip()
-        # Empty Done: → extract Thought content as the answer
         if not answer:
             thought_m = re.search(r'(?:Thought|Observation)\s*:\s*(.+)',
                                    c[:done_m.start()], re.DOTALL | re.IGNORECASE)
             before = c[:done_m.start()].strip()
             answer = thought_m.group(1).strip() if thought_m else before
-        # Reject if answer is another ReAct token
         if answer and not re.match(r'^(Bash|Action|Command|Thought)\s*:', answer, re.I):
-            # Trim trailing ReAct lines that got captured by DOTALL
             answer = re.split(r'\n(?:Bash|Action|Thought|Command)\s*:', answer)[0].strip()
             if answer:
-                return [{"name": "task_done",
-                         "args": {"output": answer, "summary": answer[:120]}}]
+                return [{'name': 'task_done',
+                         'args': {'output': answer, 'summary': answer[:120]}}]
 
-    # ── Format 1: Bash code block ─────────────────────────────────────────────
+    # ── Step 3: Raw JSON object anywhere in output ────────────────────────────
+    # Handles: {"name": "str_replace", "args": {...}} written by deepseek/mistral
+    json_m = re.search(r'(\{[^{}]*"(?:name|tool|function)"\s*:\s*"[\w_]+"[^{}]*\})', c, re.DOTALL)
+    if json_m:
+        parsed = _safe_json(json_m.group(1))
+        if parsed:
+            name = parsed.get('name') or parsed.get('tool') or parsed.get('function')
+            args = parsed.get('args') or parsed.get('arguments') or parsed.get('parameters') or {}
+            if name:
+                return [{'name': name, 'args': args}]
+
+    # Nested: {"name": "str_replace", "args": {"path": ..., "old_str": ..., "new_str": ...}}
+    nested_m = re.search(
+        r'\{\s*"name"\s*:\s*"([\w_]+)"\s*,\s*"(?:args|arguments|parameters)"\s*:\s*(\{.*?\})\s*\}',
+        c, re.DOTALL
+    )
+    if nested_m:
+        args = _safe_json(nested_m.group(2))
+        return [{'name': nested_m.group(1), 'args': args or {}}]
+
+    # ── Step 4: Bash code block ───────────────────────────────────────────────
     m = re.search(
         r'(?:Bash|Action|Command)\s*:\s*\n```(?:bash|shell|sh|cmd)?\s*\n(.*?)\n```',
         c, re.DOTALL | re.IGNORECASE
@@ -107,32 +145,23 @@ def parse_tool_calls(content: str) -> list[dict]:
     if m:
         cmd = m.group(1).strip()
         if cmd and not re.match(r'^(Done|Answer|Final|Thought|Result)\s*:', cmd, re.I):
-            return [{"name": "bash", "args": {"command": cmd}}]
+            return [{'name': 'bash', 'args': {'command': cmd}}]
 
-    # ── Format 2: Bash inline (single line) ───────────────────────────────────
-    m = re.search(r'^(?:Bash|Action|Command)\s*:\s*(.+)$', c,
-                  re.MULTILINE | re.IGNORECASE)
+    # ── Step 5: Bash inline ───────────────────────────────────────────────────
+    m = re.search(r'^(?:Bash|Action|Command)\s*:\s*(.+)$', c, re.MULTILINE | re.IGNORECASE)
     if m:
         cmd = m.group(1).strip().strip('`')
         if (cmd and not cmd.startswith('{')
                 and not re.match(r'^(Done|Answer|Final|Result|Thought)\s*:', cmd, re.I)):
-            return [{"name": "bash", "args": {"command": cmd}}]
+            return [{'name': 'bash', 'args': {'command': cmd}}]
 
-    # ── Format 3: XML <tool>/<args> ───────────────────────────────────────────
+    # ── Step 6: XML <tool>/<args> ─────────────────────────────────────────────
     m = re.search(
         r'<tool>\s*([\w_]+)\s*</tool>\s*(?:<args>)?\s*(\{.*?\})\s*(?:</args>)?',
         c, re.DOTALL
     )
     if m:
-        return [{"name": m.group(1).strip(), "args": _safe_json(m.group(2))}]
-
-    # ── Format 4: Raw JSON tool call ──────────────────────────────────────────
-    m = re.search(
-        r'\{"name"\s*:\s*"([\w_]+)"\s*,\s*"(?:args|arguments|parameters)"\s*:\s*(\{.*?\})\s*\}',
-        c, re.DOTALL
-    )
-    if m:
-        return [{"name": m.group(1), "args": _safe_json(m.group(2))}]
+        return [{'name': m.group(1).strip(), 'args': _safe_json(m.group(2))}]
 
     return []
 
