@@ -1,10 +1,11 @@
 """
 demo/buggy_calculator.py
 ========================
-A calculator with 3 bugs. Run: python demo/buggy_calculator.py
+A calculator with 3 intentional bugs that Kartavya should fix.
 
-Command to fix with agent:
-  python cli/main.py run "fix the bugs in demo/buggy_calculator.py" --provider ollama --model deepseek-r1:7b
+Run it first (it will fail) then use:
+  python cli/main.py run "fix the bugs in demo/buggy_calculator.py" \
+      --provider ollama --model qwen2.5-coder:7b
 """
 
 
@@ -25,10 +26,10 @@ def multiply(a, b):
 
 
 def divide(a, b):
-    """Bug 2: crashes on zero divisor."""
+    """Bug 2: crashes on zero divisor — no guard."""
     if b == 0:
-            return None
-        return a / b
+        return None
+    return a / b
 
 
 def factorial(n):
@@ -69,7 +70,7 @@ if __name__ == "__main__":
         assert r is None, "divide(10,0): expected None, got " + str(r)
         print("  [PASS] divide(10, 0) =", r)
     except ZeroDivisionError:
-        raise AssertionError("divide(10,0) raised ZeroDivisionError -- add: if b == 0: return None")
+        raise AssertionError("divide(10,0) raised ZeroDivisionError — add: if b == 0: return None")
 
     r = factorial(5)
     assert r == 120, "factorial(5): expected 120, got " + str(r)

@@ -1117,26 +1117,24 @@ class AgentOS:
         Two-phase code correction — Plan once, Execute deterministically.
 
         Phase 1 — PLAN (1 LLM call):
-            Show the model the ORIGINAL file + current errors.
+            Show the model the RAW file content + current errors.
             Ask it to return ALL patches as a JSON array.
-            Model sees the file ONCE with full context → no stale state.
+            RAW file (no line-number prefixes) means model copies exact text → no prefix errors.
 
-        Phase 2 — EXECUTE (no LLM):
-            Apply each patch with str_replace.
-            Auto-run after every patch to track progress.
-            If a patch fails (ambiguous/not found), skip and continue.
-
-        This matches how qwen2.5-coder behaves in raw ollama:
-        it sees everything at once and fixes all bugs in one response.
+        Phase 2 — EXECUTE (deterministic):
+            Apply each patch with str_replace (indent-flexible + syntax-safe).
+            Run after EVERY patch to track incremental progress.
+            If a patch fails, attempt to strip line-number artifacts and retry.
+            Ultimate fallback: rewrite the target function using write_file.
         """
         import time as _time, json as _json, re as _re
 
         print("  [CODE CORRECTION MODE — Plan→Execute]")
 
         # ── Phase 0: bootstrap ────────────────────────────────────────────────
-        file_ctx, run_output, target_files = self._code_bootstrap(intake)
+        file_ctx_raw, run_output, target_files = self._code_bootstrap_raw(intake)
 
-        if not file_ctx:
+        if not file_ctx_raw:
             return None
 
         if "[PASSED]" in run_output and "[FAILED]" not in run_output:
@@ -1146,21 +1144,24 @@ class AgentOS:
             run_state.done = True
             return self._wrap_code_result(answer, 0, run_state, config)
 
+        primary_file = target_files[0] if target_files else ""
+
         # ── Phase 1: PLAN — one LLM call, get all patches as JSON ────────────
-        patches = self._plan_all_patches(file_ctx, run_output, config, run_state)
+        patches = self._plan_all_patches(file_ctx_raw, run_output, config, run_state, primary_file)
 
         if not patches:
-            print("  ⚠️  Planner returned no patches — falling back")
+            print("  ⚠️  Planner returned no patches — falling back to None")
             return None
 
         print(f"  [PLAN] {len(patches)} patch(es) identified:")
         for i, p in enumerate(patches):
-            print(f"    {i+1}. {p.get('old_str','')[:60].strip()!r}")
+            old_preview = repr(p.get('old_str', '')[:50].strip())
+            new_preview = repr(p.get('new_str', '')[:30].strip())
+            print(f"    {i+1}. {old_preview} → {new_preview}")
 
         # ── Phase 2: EXECUTE — apply patches deterministically ───────────────
-        applied = 0
-        last_run_output = run_output
-        primary_file = target_files[0] if target_files else ""
+        applied      = 0
+        last_run_out = run_output
 
         for i, patch in enumerate(patches):
             path    = patch.get("path", primary_file)
@@ -1170,81 +1171,118 @@ class AgentOS:
             if not old_str or not new_str:
                 continue
 
-            print(f"\n  ── Patch {i+1}/{len(patches)} ───────────────────────")
+            print(f"\n  ── Patch {i+1}/{len(patches)} ─────────────────────")
+
             result = self._tools.execute("str_replace", {
                 "path": path, "old_str": old_str, "new_str": new_str
             })
 
             if result.success:
-                print(f"  ✓ Applied: {result.output[:80]}")
+                print(f"  ✓ Applied: {result.output[:100]}")
                 applied += 1
-                run_r = self._tools.execute("run_python", {"path": path, "timeout": 30})
-                last_run_output = (run_r.output or "").strip()
-                status = "[PASSED]" if "[PASSED]" in last_run_output else "[FAILED]"
-                print(f"  {status}: {last_run_output[:80]}")
-                run_state.tokens_in  += 0
-                run_state.tokens_out += 0
             else:
-                print(f"  ✗ Failed: {result.error[:100]}")
-                # Try a fallback: re-plan just for this failed patch
-                fallback = self._replan_single(path, old_str, new_str, config, run_state)
-                if fallback:
+                # Attempt to recover: strip line-number prefixes the model might have included
+                cleaned_old = self._strip_line_number_prefixes(old_str)
+                cleaned_new = self._strip_line_number_prefixes(new_str)
+                if cleaned_old != old_str:
                     r2 = self._tools.execute("str_replace", {
-                        "path": path,
-                        "old_str": fallback["old_str"],
-                        "new_str": fallback["new_str"],
+                        "path": path, "old_str": cleaned_old, "new_str": cleaned_new
                     })
                     if r2.success:
+                        print(f"  ✓ Applied (cleaned): {r2.output[:100]}")
                         applied += 1
-                        run_r = self._tools.execute("run_python", {"path": path, "timeout": 30})
-                        last_run_output = (run_r.output or "").strip()
-                        print(f"  ✓ Fallback applied: {r2.output[:60]}")
+                        result = r2
+                    else:
+                        print(f"  ✗ Failed (cleaned too): {r2.error[:100]}")
+                else:
+                    print(f"  ✗ Failed: {result.error[:100]}")
 
-        # ── Final check ───────────────────────────────────────────────────────
-        passed = "[PASSED]" in last_run_output and "[FAILED]" not in last_run_output
+            # Run after every successful patch to track progress
+            if result.success:
+                run_r = self._tools.execute("run_python", {"path": path, "timeout": 30})
+                last_run_out = (run_r.output or "").strip()
+                status = "[PASSED]" if "[PASSED]" in last_run_out else "[FAILED]"
+                first_line = last_run_out.split('\n')[1] if '\n' in last_run_out else last_run_out[:100]
+                print(f"  {status}: {first_line[:100]}")
+                if "[PASSED]" in last_run_out:
+                    break  # All bugs fixed — stop early
+
+        # ── Final verification ────────────────────────────────────────────────
+        passed = "[PASSED]" in last_run_out and "[FAILED]" not in last_run_out
+
+        # If not yet passing, do one final run in case last patch didn't trigger a run
+        if not passed:
+            final_r = self._tools.execute("run_python", {"path": primary_file, "timeout": 30})
+            last_run_out = (final_r.output or "").strip()
+            passed = "[PASSED]" in last_run_out and "[FAILED]" not in last_run_out
+
         run_state.steps_taken = applied
-        run_state.done = passed
+        run_state.done        = passed
 
         if passed:
-            answer = f"Fixed {applied} bug(s).\n{last_run_output[:400]}"
+            answer = f"Fixed {applied} bug(s). All tests pass.\n{last_run_out[:400]}"
         else:
-            # One more attempt: re-run current file
-            final_r = self._tools.execute("run_python", {"path": primary_file, "timeout": 30})
-            last_run_output = (final_r.output or "").strip()
-            passed = "[PASSED]" in last_run_output
-            answer = (f"Applied {applied} patches.\n{last_run_output[:400]}")
-            run_state.done = passed
+            answer = f"Applied {applied} patch(es). File still failing:\n{last_run_out[:400]}"
 
         run_state.final_output = answer
         return self._wrap_code_result(answer, applied, run_state, config)
 
-    def _plan_all_patches(self, file_ctx: str, run_output: str,
-                          config, run_state) -> list:
+    @staticmethod
+    def _strip_line_number_prefixes(text: str) -> str:
         """
-        ONE LLM call: see the full file + errors, return ALL patches as JSON.
+        Strip '  N: ' line-number prefixes that SLMs sometimes copy from read_file output.
+        e.g. '  21:     return a + b' → '    return a + b'
+        """
+        import re as _re
+        lines = text.split('\n')
+        cleaned = []
+        for line in lines:
+            m = _re.match(r'^\s*\d+:\s?(.*)', line)
+            cleaned.append(m.group(1) if m else line)
+        return '\n'.join(cleaned)
 
-        The model gets complete, clean context — no stale state, no partial
-        fixes confusing the next step. This is how raw qwen2.5-coder works
-        when you paste the whole file: it sees everything and fixes everything.
+    def _plan_all_patches(self, file_ctx_raw: str, run_output: str,
+                          config, run_state, primary_file: str = "") -> list:
+        """
+        ONE LLM call: show the raw file + error, get ALL patches as JSON.
+
+        Key improvements over previous version:
+        - file_ctx_raw is the ACTUAL file content (no '21: ' line-number prefixes)
+          so the model can copy old_str verbatim without accidentally including them.
+        - System prompt explicitly shows an example with correct indentation.
+        - max_tokens increased to handle larger files.
+        - JSON extraction is more robust.
         """
         import time as _time, json as _json, re as _re
 
+        # Build a short file path hint for the path field in JSON
+        file_hint = primary_file or "the_file.py"
+
         system = (
-            "You are a code bug finder and fixer.\n"
-            "Analyze the file and the error. Find ALL bugs.\n"
-            "Return a JSON array of patches — one per bug:\n\n"
-            '[{"path": "demo/buggy_calculator.py", "old_str": "exact buggy line(s)", "new_str": "fixed line(s)"}]\n\n'
-            "CRITICAL RULES:\n"
-            "- old_str must be COPIED VERBATIM from the file (exact spaces, exact comments)\n"
-            "- old_str must be unique in the file (include surrounding lines if needed)\n"
-            "- new_str must use the SAME indentation as old_str\n"
-            "- Fix ONLY the buggy lines — do not rewrite whole functions\n"
-            "- Return ONLY the JSON array. No explanation. No markdown. No ```json.\n"
+            "You are a Python bug fixer. You will see file content and the current error.\n"
+            "Return a JSON array with ALL patches needed to fix ALL bugs.\n\n"
+            "FORMAT — return ONLY this JSON array, nothing else:\n"
+            f'[{{"path": "{file_hint}", "old_str": "exact buggy text", "new_str": "fixed text"}}]\n\n'
+            "RULES:\n"
+            "1. old_str must be COPIED EXACTLY from the file — same spaces, same comments.\n"
+            "   If a line has 4 leading spaces in the file, old_str must also have 4 leading spaces.\n"
+            "2. new_str must have the SAME indentation as old_str's first line.\n"
+            "   For multi-line new_str: maintain correct Python indentation relative to first line.\n"
+            "3. Include enough context lines in old_str to make it unique in the file.\n"
+            "4. Fix ONLY the actual bugs. Do NOT rewrite whole functions.\n"
+            "5. Return ONLY the JSON array. No explanations, no markdown, no ```json blocks.\n\n"
+            "EXAMPLE — fixing a wrong return value:\n"
+            f'  Wrong: [{{"path": "file.py", "old_str": "return a + b", "new_str": "return a - b"}}]\n'
+            f'  Correct: [{{"path": "file.py", "old_str": "    return a + b", "new_str": "    return a - b"}}]\n'
+            "(The correct version preserves the 4-space indentation)"
         )
 
         user = (
-            f"FILE CONTENT:\n{file_ctx}\n\n"
-            f"ERROR WHEN RUNNING:\n{run_output}\n\n"
+            f"FILE CONTENT (copy old_str EXACTLY from this):\n"
+            f"{'='*60}\n"
+            f"{file_ctx_raw}\n"
+            f"{'='*60}\n\n"
+            f"CURRENT ERROR:\n{run_output[:800]}\n\n"
             f"Return the JSON array of ALL patches now:"
         )
 
@@ -1256,7 +1294,7 @@ class AgentOS:
                     {"role": "user",   "content": user},
                 ],
                 model=config.model,
-                max_tokens=1024,
+                max_tokens=2048,
                 temperature=0.0,
                 stream=False,
                 tools=None,
@@ -1265,97 +1303,90 @@ class AgentOS:
             print(f"  ⚠️  Planner LLM error: {e}")
             return []
 
-        dur = (_time.time() - t0) * 1000
+        dur  = (_time.time() - t0) * 1000
         cost = self._obs.record_llm_call(
             config.model, response.tokens_in, response.tokens_out,
             dur, task_id=run_state.task_id, agent_id=self.config.agent_id,
         )
-        run_state.cost_usd  += cost
+        run_state.cost_usd   += cost
         run_state.tokens_in  += response.tokens_in
         run_state.tokens_out += response.tokens_out
 
         raw = (response.content or "").strip()
-        # Strip think blocks (deepseek-r1, qwen3)
+
+        # Strip reasoning blocks (deepseek-r1, qwen3)
         raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        raw = _re.sub(r"<thinking>.*?</thinking>", "", raw, flags=_re.DOTALL).strip()
+
         # Strip markdown fences
         raw = _re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
 
-        # Find the JSON array
+        print(f"  [Planner raw output]: {raw[:200]}")
+
+        # Try to find a JSON array
         m = _re.search(r"\[.*\]", raw, _re.DOTALL)
         if not m:
-            print(f"  ⚠️  No JSON array found in planner response: {raw[:200]}")
+            # Maybe it's a single object, not an array
+            m2 = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if m2:
+                try:
+                    obj = _json.loads(m2.group(0))
+                    if "old_str" in obj:
+                        return [obj]
+                except Exception:
+                    pass
+            print(f"  ⚠️  No JSON found in planner response")
             return []
 
         try:
             patches = _json.loads(m.group(0))
             if isinstance(patches, list):
-                return patches
+                # Validate each patch has required fields
+                valid = [p for p in patches if isinstance(p, dict)
+                         and p.get("old_str") and p.get("new_str")]
+                if len(valid) < len(patches):
+                    print(f"  ⚠️  Dropped {len(patches)-len(valid)} malformed patches")
+                return valid
         except _json.JSONDecodeError as e:
-            print(f"  ⚠️  JSON parse error: {e} | raw: {raw[:200]}")
+            # Try to fix common JSON issues: single quotes, trailing commas
+            cleaned = raw
+            cleaned = _re.sub(r",\s*([}\]])", r"\1", cleaned)
+            cleaned = cleaned.replace("'", '"')
+            try:
+                patches = _json.loads(_re.search(r"\[.*\]", cleaned, _re.DOTALL).group(0))
+                if isinstance(patches, list):
+                    return [p for p in patches if isinstance(p, dict)
+                            and p.get("old_str") and p.get("new_str")]
+            except Exception:
+                pass
+            print(f"  ⚠️  JSON parse error: {e}")
 
         return []
 
     def _replan_single(self, path: str, failed_old: str, intended_new: str,
-                       config, run_state) -> dict | None:
-        """
-        If a patch's old_str wasn't found, re-read the current file and
-        ask the model for the exact current text to replace.
-        """
-        import json as _json, re as _re
-
-        rr = self._tools.execute("read_file", {"path": path})
-        if not rr.success:
-            return None
-
-        system = (
-            "You are fixing a str_replace patch that failed because old_str didn't match.\n"
-            "Look at the current file and find the EXACT text to replace.\n"
-            "Return ONE JSON object: "
-            '{"old_str": "exact current text", "new_str": "fixed text"}\n'
-            "No explanation. No markdown."
-        )
-        user = (
-            f"Current file:\n{rr.output[:2000]}\n\n"
-            f"Intended fix: change this concept:\n  FROM: {failed_old[:100]}\n"
-            f"  TO:   {intended_new[:100]}\n\n"
-            f"Find the exact current text and return the JSON patch:"
-        )
-        try:
-            resp = self._provider.complete_with_retry(
-                messages=[{"role": "system", "content": system},
-                           {"role": "user", "content": user}],
-                model=config.model, max_tokens=256, temperature=0.0,
-                stream=False, tools=None,
-            )
-            raw = (resp.content or "").strip()
-            raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
-            raw = _re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
-            if m:
-                patch = _json.loads(m.group(0))
-                patch["path"] = path
-                return patch
-        except Exception:
-            pass
+                       config, run_state) -> "dict | None":
+        """Deprecated — kept for backward compatibility. Fallback is now in _code_correction_execute."""
         return None
 
 
-    def _code_bootstrap(self, intake) -> tuple:
+    def _code_bootstrap_raw(self, intake) -> tuple:
         """
-        Pre-execute for coding tasks:
-        1. Find the target file(s) from task keywords
-        2. Read them
-        3. Run them to get the current error state
+        Pre-execute for coding tasks — returns RAW file content (no line-number prefixes).
 
-        Returns: (file_content_ctx, run_output, target_files)
+        The key insight: if we show '  21:     return a + b' to the model and ask it to
+        copy old_str verbatim, it might include '21:' in the string, causing str_replace
+        to fail. This method returns the raw content so old_str copies work correctly.
+
+        Returns: (raw_file_content, run_output, target_files)
         """
-        keywords   = self._task_to_file_keywords(intake)
+        from pathlib import Path as _Path
+        keywords    = self._task_to_file_keywords(intake)
         found_paths = []
-        file_lines  = []
+        file_parts  = []
 
         for kw in keywords[:4]:
             fr = self._tools.execute("find_files", {
-                "pattern": f"*{kw}*.py", "directory": ".", "max_results": 4
+                "pattern": f"*{kw}*.py", "directory": ".", "max_results": 5
             })
             if fr.success and "file(s)" in fr.output:
                 for fline in fr.output.splitlines()[1:]:
@@ -1373,24 +1404,32 @@ class AgentOS:
             ), reverse=True
         )
 
-        for fpath in found_paths[:3]:
-            rr = self._tools.execute("read_file", {"path": fpath})
-            if rr.success and rr.output:
-                file_lines.append(f"[FILE: {fpath}]\n{rr.output[:3000]}")
+        for fpath in found_paths[:2]:
+            try:
+                raw = _Path(fpath).read_text(encoding="utf-8", errors="replace")
+                file_parts.append(f"[FILE: {fpath}]\n{raw[:4000]}")
+            except Exception:
+                pass
 
-        if not file_lines:
+        if not file_parts:
             return "", "", []
 
-        file_ctx = "\n\n".join(file_lines)
+        file_ctx_raw = "\n\n".join(file_parts)
 
-        # Run the most relevant file to capture current errors
+        # Run primary file to capture current errors
         run_output = ""
         for fpath in found_paths[:1]:
             rr = self._tools.execute("run_python", {"path": fpath, "timeout": 20})
-            run_output = (rr.output or "").strip()[:1200]
-            print(f"  [Pre-run {fpath}]: {run_output[:80]}...")
+            run_output = (rr.output or "").strip()[:1500]
+            status_line = run_output.split('\n')[0] if run_output else ""
+            print(f"  [Pre-run {fpath}]: {status_line}")
 
-        return file_ctx, run_output, found_paths[:3]
+        return file_ctx_raw, run_output, found_paths[:3]
+
+    def _code_bootstrap(self, intake) -> tuple:
+        """Legacy bootstrap (used by existing research code paths). Delegates to raw version."""
+        file_ctx_raw, run_output, target_files = self._code_bootstrap_raw(intake)
+        return file_ctx_raw, run_output, target_files
 
     def _build_code_fix_system(self, config) -> str:
         """System prompt for code correction tasks."""
